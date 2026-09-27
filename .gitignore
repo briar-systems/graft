@@ -1,1 +1,5 @@
 out/
+# a subproject's git dependencies are pinned by committed gitlinks, and only
+# its path copy of graft stays out
+example/dep/graft/
+example/out/

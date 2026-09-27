@@ -1,3 +1,48 @@
 [submodule "dep/std"]
 	path = dep/std
 	url = https://github.com/briar-systems/mach-std
+[submodule "dep/hedge"]
+	path = dep/hedge
+	url = https://github.com/briar-systems/hedge
+[submodule "dep/crypto"]
+	path = dep/crypto
+	url = https://github.com/briar-systems/mach-crypto
+[submodule "dep/http"]
+	path = dep/http
+	url = https://github.com/briar-systems/mach-http
+[submodule "dep/tls"]
+	path = dep/tls
+	url = https://github.com/briar-systems/mach-tls
+[submodule "dep/quic"]
+	path = dep/quic
+	url = https://github.com/briar-systems/mach-quic
+[submodule "dep/acme"]
+	path = dep/acme
+	url = https://github.com/briar-systems/mach-acme
+[submodule "dep/laurel"]
+	path = dep/laurel
+	url = https://github.com/briar-systems/laurel
+[submodule "example/dep/std"]
+	path = example/dep/std
+	url = https://github.com/briar-systems/mach-std
+[submodule "example/dep/crypto"]
+	path = example/dep/crypto
+	url = https://github.com/briar-systems/mach-crypto
+[submodule "example/dep/http"]
+	path = example/dep/http
+	url = https://github.com/briar-systems/mach-http
+[submodule "example/dep/tls"]
+	path = example/dep/tls
+	url = https://github.com/briar-systems/mach-tls
+[submodule "example/dep/quic"]
+	path = example/dep/quic
+	url = https://github.com/briar-systems/mach-quic
+[submodule "example/dep/acme"]
+	path = example/dep/acme
+	url = https://github.com/briar-systems/mach-acme
+[submodule "example/dep/hedge"]
+	path = example/dep/hedge
+	url = https://github.com/briar-systems/hedge
+[submodule "example/dep/laurel"]
+	path = example/dep/laurel
+	url = https://github.com/briar-systems/laurel
