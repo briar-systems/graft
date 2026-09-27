@@ -90,17 +90,17 @@ The compiler version is `MACH_VERSION` in `ci.yml`. Change it together with the
 
 ## Releases
 
-1. Set `version` in `mach.toml` and merge that into `dev`.
+1. Set `version` in `mach.toml`, add its `## [X.Y.Z]` section to `CHANGELOG.md`
+   and merge that into `dev`.
 2. Merge `dev` into `main` through a pull request, which runs every leg.
-3. Tag `main` and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. Tag `main` and push the tag: `git tag -a vX.Y.Z -m "graft X.Y.Z" && git push origin vX.Y.Z`.
 
-`.github/workflows/cd.yml` checks that the tag matches the manifest version,
-runs every CI leg, and publishes a GitHub release with notes generated from the
-merged pull requests. The release carries every executable the manifest builds,
-one archive per target (`.zip` for Windows, `.tar.gz` elsewhere), plus
-`SHA256SUMS`. The names and paths come from `mach build --plan`, so a new
-target or artifact in `mach.toml` is packaged with no workflow change. A tag with a prerelease part, such as `v1.0.0-rc.1`, is
-published as a prerelease.
+`.github/workflows/cd.yml` calls the org's shared `mach-release.yml`, which
+checks that the tag matches the manifest version and has a CHANGELOG section,
+runs every CI leg, and publishes a GitHub release with that section as its
+notes. A tag with a prerelease part, such as `v1.0.0-rc.1`, is published as a
+prerelease. A dispatch of `Release` rehearses the same path under a throwaway
+tag.
 
 ## License
 
