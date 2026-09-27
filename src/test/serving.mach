@@ -12,6 +12,7 @@ use hedge.clock;
 use laurel.app;
 use laurel.handler;
 use laurel.observability;
+use laurel.task;
 use std.allocator;
 use std.allocator.page;
 use std.chrono.duration;
@@ -51,6 +52,11 @@ rec Harness {
     target:      local_socket.Endpoint;
     thread:      thread.Thread;
     supervising: bool;
+    # how the site is assembled once the host hands it its setup
+    not_ready:       usize;
+    stuck:           bool;
+    handler_timeout: opt[duration.Duration];
+    work:            bool;
 }
 
 fun wait(value: *i64, at_least: i64) bool {
@@ -163,6 +169,8 @@ fun write_config(harness: *Harness, routed: str, drain_ms: u64, orders_only: boo
 
 fun assemble(ctx: ptr, setup: *host.Setup) *app.App {
     val harness: *Harness = ctx::*Harness;
+    if (!site.assemble_site(?harness.site, setup.providers, harness.not_ready, harness.stuck,
+        harness.handler_timeout, harness.work)) { ret nil; }
     ret ?harness.site.application;
 }
 
@@ -185,10 +193,10 @@ fun boot(harness: *Harness, routed: str, drain_ms: u64, not_ready: usize, stuck:
         allocator.zallocate[host.Process](?harness.heap, 1);
     if (sel stored.err) { ret false; }
     harness.process = stored.ok;
-    if (!name(harness) || !write_config(harness, routed, drain_ms, false)
-        || !site.assemble_site(?harness.site, not_ready, stuck, handler_timeout)) {
-        ret false;
-    }
+    if (!name(harness) || !write_config(harness, routed, drain_ms, false)) { ret false; }
+    harness.not_ready       = not_ready;
+    harness.stuck           = stuck;
+    harness.handler_timeout = handler_timeout;
     var options: host.Options = host.options((?harness.path[0])::str, "site");
     options.label = "graft-test";
     if (!host.start(harness.process, ?harness.heap, options, host.Application{
@@ -505,6 +513,34 @@ $if ($mach.build.os == $mach.os.linux) {
         if (!order || harness.site.probe.order != 7) { ret 4; }
         if (phases.starts != 1 || phases.stops != 1) { ret 5; }
         if (code != host.EXIT_OK)                    { ret 6; }
+        ret 0;
+    }
+
+    # a hosted application's task runs on hedge's task thread through laurel's
+    # task provider, and the application's drain waits for the run in flight
+    # before the application is stopped
+    test tasks__drain_waits_for_the_run {
+        var harness: Harness;
+        harness.work = true;
+        if (!boot(?harness, "site", 2000, 0, false, opt[duration.Duration].none{})) { ret 1; }
+        val work:  *site.Work = ?harness.site.work;
+        val ready: bool       = ready(?harness, 1) && wait(?work.steps, 1);
+        # the snapshot the run published, read without waiting on it
+        var read:  bool = false;
+        var lease: task.Lease;
+        if (ready && task.read(work.tasks, work.handle, ?lease) == task.STATUS_OK) {
+            read = site.same_text(lease.data, lease.len, "tick");
+            task.release(work.tasks, ?lease);
+        }
+        val running: bool = atomic.load(?work.finished) == 0;
+        val code:    i64  = finish(?harness);
+        if (!ready)                               { ret 2; }
+        if (!read)                                { ret 3; }
+        if (!running)                             { ret 4; }
+        if (work.cancelled_ns == 0)               { ret 5; }
+        if (!harness.site.phases.worked_at_stop)  { ret 6; }
+        if (!harness.site.phases.drained_at_stop) { ret 7; }
+        if (code != host.EXIT_OK)                 { ret 8; }
         ret 0;
     }
 }

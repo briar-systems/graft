@@ -8,10 +8,11 @@
 # the supervisor itself.
 #
 # graft imports only the hedge items hedge's `doc/HOSTING.md` names as the host
-# contract, version 1.1.
+# contract, version 1.2.
 
 use graft.bridge.lifecycle;
 use graft.bridge.request;
+use task_bridge: graft.bridge.task;
 use hedge.composition;
 use hedge.config.loader;
 use hedge.config.schema;
@@ -21,8 +22,11 @@ use hedge_lifecycle: hedge.lifecycle;
 use hedge.service;
 use hedge.spread;
 use hedge.supervisor;
+use hedge_task: hedge.task;
 use http.core.message;
 use laurel.app;
+use laurel.provider;
+use laurel.task;
 use std.allocator;
 use std.allocator.fixed;
 use std.allocator.page;
@@ -37,6 +41,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.view;
 
 pub val EXIT_OK:      i64 = 0;
 pub val EXIT_RUNTIME: i64 = 70;
@@ -72,6 +77,11 @@ pub rec Setup {
     # the limits hedge commits every response under, which laurel's error
     # rendering must not exceed
     limits: message.Limits;
+    # the facilities graft supplies the application, as one entry for its
+    # provider set: the task provider under `task.key()`, whose tasks run on
+    # hedge's task thread. an application that supplies its own lists it
+    # before this entry
+    providers: provider.Provider;
 }
 
 # assemble the application against the setup and answer it, not started, or
@@ -100,7 +110,9 @@ pub rec Options {
     # answers the configuration's `${ENV:NAME}` references
     resolver:     loader.Resolver;
     capabilities: loader.Capabilities;
-    # hedge's own process options. `applications` is graft's
+    # hedge's own process options. `applications` is graft's. `tasks` is the
+    # program's own task facility when it has one, and graft makes one when it
+    # is nil
     process: composition.Options;
     # whether the supervisor takes SIGINT, SIGTERM and SIGHUP
     signals: bool;
@@ -146,8 +158,12 @@ pub rec Process {
     diagnostics: schema.Diagnostics;
     composed:    composition.Runtime;
     supervising: supervisor.Supervisor;
-    supervised:  bool;
-    serving:     bool;
+    # the task facility graft made when the program gave none, and the laurel
+    # task provider over whichever facility the process runs
+    facility:   hedge_task.Tasks;
+    tasks:      task_bridge.Tasks;
+    supervised: bool;
+    serving:    bool;
     # the exit status a start that did not serve settled on
     refused: i64;
 }
@@ -216,6 +232,25 @@ fun load(context: ptr, id: u64, active: *generation.Generation) *generation.Gene
     ret seal(process, target, id);
 }
 
+fun same_key(a: view.View, b: view.View) bool {
+    if (a.len != b.len || a.data == nil || b.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the facilities graft supplies under their keys. any other key is not graft's
+fun resolve_provider(context: ptr, key: view.View) res[ptr, view.View] {
+    val process: *Process = context::*Process;
+    if (same_key(key, task.key())) {
+        ret res[ptr, view.View].ok{task_bridge.provider(?process.tasks)::ptr};
+    }
+    ret res[ptr, view.View].ok{nil};
+}
+
 fun refuse(process: *Process, code: i64, message: str) bool {
     if (message != nil) { say(process, message); }
     process.refused = code;
@@ -253,9 +288,22 @@ pub fun start(process: *Process, heap: *allocator.Allocator, options: Options,
     val candidate: *generation.Generation = seal(process, 0, 1);
     if (candidate == nil) { ret refuse(process, EXIT_CONFIG, nil); }
 
+    var composing: composition.Options = options.process;
+    composing.applications = ?process.registry;
+    if (composing.tasks == nil) {
+        if (!hedge_task.make(?process.facility, hedge_task.default_options())) {
+            ret refuse(process, EXIT_RUNTIME, "the task facility could not be made");
+        }
+        composing.tasks = ?process.facility;
+    }
+    if (!task_bridge.make(?process.tasks, composing.tasks)) {
+        ret refuse(process, EXIT_RUNTIME, "the task provider could not be made");
+    }
+
     var setup: Setup = Setup{name: options.name,
         limits: connection.message_limits(?candidate.graph,
-        connection.config_from(?candidate.graph))};
+        connection.config_from(?candidate.graph)),
+        providers: provider.Provider{ctx: process::ptr, resolve: resolve_provider}};
     process.assembled = application.assemble(application.ctx, ?setup);
     if (process.assembled == nil) {
         ret refuse(process, EXIT_RUNTIME, "the application could not be assembled");
@@ -266,8 +314,6 @@ pub fun start(process: *Process, heap: *allocator.Allocator, options: Options,
         ret refuse(process, EXIT_RUNTIME, "the application could not be registered");
     }
 
-    var composing: composition.Options = options.process;
-    composing.applications = ?process.registry;
     val workers: usize                   = spread.count(?candidate.graph);
     val started: composition.StartReport = composition.start_process(?process.composed,
         heap, ?candidate.graph, candidate.id, ?process.diagnostics, composing, workers);
