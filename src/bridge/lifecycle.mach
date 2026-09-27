@@ -9,7 +9,13 @@
 # the task provider the application's provider set resolves drains beside the
 # application toward the same deadline, and is stopped after it, so the
 # application's drain is not done while one of its task runs is in flight.
+#
+# when the application's provider set resolves graft's providers, the start
+# step hands their settings bridge the generation hedge published before the
+# application starts, and the reload step hands it each generation a reload
+# publishes. the application is never restarted.
 
+use graft.bridge.providers;
 use hedge.clock;
 use hedge.service;
 use laurel.app;
@@ -30,7 +36,9 @@ fun step(result: lifecycle.Transition) service.Step {
 }
 
 fun start(owner: ptr) service.Step {
-    ret step(app.start(owner::*app.App));
+    val application: *app.App = owner::*app.App;
+    providers.take_generation(providers.resolve(application.providers));
+    ret step(app.start(application));
 }
 
 fun ready(owner: ptr) service.Step {
@@ -109,10 +117,16 @@ fun stop(owner: ptr) service.Step {
     ret step(app.cleanup_failure(application));
 }
 
+# a reload never touches the application itself, only what graft hands it
+fun reload(owner: ptr) service.Step {
+    providers.take_generation(providers.resolve((owner::*app.App).providers));
+    ret done();
+}
+
 # the application's lifecycle components, bounded by its
 # `max_background_services`, as hedge's lifecycle hooks
 pub fun hooks(application: *app.App) service.Lifecycle {
     if (application == nil || !application.valid) { ret service.no_lifecycle(); }
     ret service.Lifecycle{ctx: application::ptr, start: start, ready: ready,
-        drain: drain, stop: stop};
+        drain: drain, stop: stop, reload: reload};
 }

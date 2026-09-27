@@ -8,11 +8,11 @@
 # the supervisor itself.
 #
 # graft imports only the hedge items hedge's `doc/HOSTING.md` names as the host
-# contract, version 1.2.
+# contract, version 1.7.
 
 use graft.bridge.lifecycle;
+use graft.bridge.providers;
 use graft.bridge.request;
-use task_bridge: graft.bridge.task;
 use hedge.composition;
 use hedge.config.loader;
 use hedge.config.schema;
@@ -26,7 +26,6 @@ use hedge_task: hedge.task;
 use http.core.message;
 use laurel.app;
 use laurel.provider;
-use laurel.task;
 use std.allocator;
 use std.allocator.fixed;
 use std.allocator.page;
@@ -54,7 +53,9 @@ pub val CONFIG_ARENA_BYTES: usize = 1048576;
 
 # register an assembled laurel application under `name`, with the request
 # bridge as its handler and the lifecycle bridge as its lifecycle. hedge's
-# supervisor starts it, so it is registered assembled and not yet started
+# supervisor starts it, so it is registered assembled and not yet started.
+# graft's providers the application's provider set resolves are bound to it,
+# so its secrets, settings and telemetry are the ones hedge keeps under `name`
 # ---
 # registry:     the registry the program hands `composition.Options.applications`
 # name:         the name the configuration's `application` routes to
@@ -66,8 +67,10 @@ pub fun mount(registry: *service.Applications, name: str, application: *app.App,
     if (registry == nil || name == nil || application == nil || !application.valid) {
         ret false;
     }
-    ret service.register_hosted(registry, name, request.handler(application),
-        lifecycle.hooks(application), memory_bytes);
+    if (!service.register_hosted(registry, name, request.handler(application),
+        lifecycle.hooks(application), memory_bytes)) { ret false; }
+    val supplied: *providers.Providers = providers.resolve(application.providers);
+    ret supplied == nil || providers.bind(supplied, registry, name);
 }
 
 # what an application is assembled against once the configuration is sealed
@@ -78,9 +81,11 @@ pub rec Setup {
     # rendering must not exceed
     limits: message.Limits;
     # the facilities graft supplies the application, as one entry for its
-    # provider set: the task provider under `task.key()`, whose tasks run on
-    # hedge's task thread. an application that supplies its own lists it
-    # before this entry
+    # provider set: laurel's task provider, whose tasks run on hedge's task
+    # thread, its secret source over the secrets hedge grants the application,
+    # its configuration provider over the application's settings, and its
+    # telemetry sink over hedge's metrics and log. an application that
+    # supplies its own provider for one of these lists it before this entry
     providers: provider.Provider;
 }
 
@@ -158,10 +163,10 @@ pub rec Process {
     diagnostics: schema.Diagnostics;
     composed:    composition.Runtime;
     supervising: supervisor.Supervisor;
-    # the task facility graft made when the program gave none, and the laurel
-    # task provider over whichever facility the process runs
+    # the task facility graft made when the program gave none, and graft's
+    # providers, the task bridge over whichever facility the process runs
     facility:   hedge_task.Tasks;
-    tasks:      task_bridge.Tasks;
+    providers:  providers.Providers;
     supervised: bool;
     serving:    bool;
     # the exit status a start that did not serve settled on
@@ -232,25 +237,6 @@ fun load(context: ptr, id: u64, active: *generation.Generation) *generation.Gene
     ret seal(process, target, id);
 }
 
-fun same_key(a: view.View, b: view.View) bool {
-    if (a.len != b.len || a.data == nil || b.data == nil) { ret false; }
-    var i: usize = 0;
-    for (i < a.len) {
-        if (a.data[i] != b.data[i]) { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-# the facilities graft supplies under their keys. any other key is not graft's
-fun resolve_provider(context: ptr, key: view.View) res[ptr, view.View] {
-    val process: *Process = context::*Process;
-    if (same_key(key, task.key())) {
-        ret res[ptr, view.View].ok{task_bridge.provider(?process.tasks)::ptr};
-    }
-    ret res[ptr, view.View].ok{nil};
-}
-
 fun refuse(process: *Process, code: i64, message: str) bool {
     if (message != nil) { say(process, message); }
     process.refused = code;
@@ -296,14 +282,14 @@ pub fun start(process: *Process, heap: *allocator.Allocator, options: Options,
         }
         composing.tasks = ?process.facility;
     }
-    if (!task_bridge.make(?process.tasks, composing.tasks)) {
-        ret refuse(process, EXIT_RUNTIME, "the task provider could not be made");
+    if (!providers.make(?process.providers, composing.tasks)) {
+        ret refuse(process, EXIT_RUNTIME, "the providers could not be made");
     }
 
     var setup: Setup = Setup{name: options.name,
         limits: connection.message_limits(?candidate.graph,
         connection.config_from(?candidate.graph)),
-        providers: provider.Provider{ctx: process::ptr, resolve: resolve_provider}};
+        providers: providers.entry(?process.providers)};
     process.assembled = application.assemble(application.ctx, ?setup);
     if (process.assembled == nil) {
         ret refuse(process, EXIT_RUNTIME, "the application could not be assembled");
@@ -394,6 +380,10 @@ pub fun finish(process: *Process) i64 {
             if (code == EXIT_OK) { code = EXIT_RUNTIME; }
         }
         process.assembled = nil;
+    }
+    if (!providers.close(?process.providers)) {
+        say(process, "the providers did not close cleanly");
+        if (code == EXIT_OK) { code = EXIT_RUNTIME; }
     }
     if (code == EXIT_OK) {
         print.print(process.options.label);
