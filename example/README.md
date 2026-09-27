@@ -322,5 +322,5 @@ Laurel refuses admission.
 
 The example builds against graft's working tree through `path = "../"`, so it
 shows whether the graft in this checkout still hosts laurel under hedge. It
-selects the exact laurel, mach-http and std releases graft pins (`=0.20.0`,
-`=0.23.0`, `=9.0.0`), and hedge `=0.13.0` comes through graft.
+selects the exact laurel, mach-http and std releases graft pins (`=0.21.0`,
+`=0.24.0`, `=9.2.0`), and hedge 0.14.0 comes through graft.
