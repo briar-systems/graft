@@ -1,0 +1,524 @@
+# the task bridge: laurel's task provider over hedge's background tasks
+#
+# a hosted application registers and triggers its tasks through `laurel.task`,
+# and each one is a hedge task that runs on the task thread hedge's supervisor
+# owns. its hedge step builds laurel's run from hedge's, steps the laurel task
+# and answers hedge's step from laurel's.
+#
+# hedge's supervisor drains and stops the facility itself, for the whole
+# process. this provider's drain and stop settle the application's own tasks
+# under laurel's rules: from the first drain it refuses registrations and
+# triggers, refuses every run that begins after it without stepping it, and
+# waits for the runs in flight to end, cutting off a run still in flight at the
+# deadline. its stop gives the provider up once that drain has settled and
+# every lease taken through it is released.
+
+use hedge.clock;
+use hedge.service;
+use hedge_task: hedge.task;
+use laurel.secret;
+use laurel.task;
+use std.chrono.duration;
+use std.chrono.time;
+use std.sync.mutex;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view;
+
+# one laurel task and the hedge task it runs as
+rec Entry {
+    used:   bool;
+    index:  u32;
+    bridge: *Tasks;
+    spec:   task.Spec;
+    handle: hedge_task.Handle;
+    # laurel's view of the run being stepped, and hedge's run behind it
+    run:     task.Run;
+    current: *hedge_task.Run;
+    # the last run this bridge admitted, and whether it may still be in flight
+    sequence: u64;
+    active:   bool;
+    stepping: bool;
+    # the admitted run was cut off at the drain deadline
+    cut: bool;
+    # runs hedge started that this bridge ended without stepping laurel: cut
+    # off at the drain deadline, or begun after the drain and refused
+    cuts:    u64;
+    refused: u64;
+    # how the last run this bridge ended itself ended, and its sequence
+    ended:     task.Outcome;
+    ended_seq: u64;
+}
+
+# caller-owned bridge state. it stays where it is made from `make` until the
+# supervisor has stopped the facility
+pub rec Tasks {
+    facility: *hedge_task.Tasks;
+    provider: task.Provider;
+    entries:  [16]Entry;
+    count:    usize;
+    # leases taken through this provider and not yet released
+    leases:   usize;
+    lock:     mutex.Mutex;
+    draining: bool;
+    deadline: opt[time.Instant];
+    stopped:  bool;
+    valid:    bool;
+}
+
+fun lock(bridge: *Tasks) {
+    mutex.lock(?bridge.lock);
+}
+
+fun unlock(bridge: *Tasks) {
+    mutex.unlock(?bridge.lock);
+}
+
+fun bridge_of(context: ptr) *Tasks {
+    val bridge: *Tasks = context::*Tasks;
+    if (bridge == nil || !bridge.valid) { ret nil; }
+    ret bridge;
+}
+
+# a laurel handle names the bridge's entry, which is never reused
+fun entry_of(bridge: *Tasks, handle: task.Handle) *Entry {
+    if (handle.generation != 1 || handle.slot::usize >= bridge.count) { ret nil; }
+    val entry: *Entry = ?bridge.entries[handle.slot::usize];
+    if (!entry.used) { ret nil; }
+    ret entry;
+}
+
+fun handle_of(entry: *Entry) task.Handle {
+    ret task.Handle{slot: entry.index, generation: 1};
+}
+
+fun status(value: hedge_task.Status) task.Status {
+    if (value == hedge_task.STATUS_OK)        { ret task.STATUS_OK; }
+    if (value == hedge_task.STATUS_DRAINING)  { ret task.STATUS_DRAINING; }
+    if (value == hedge_task.STATUS_FULL)      { ret task.STATUS_FULL; }
+    if (value == hedge_task.STATUS_EMPTY)     { ret task.STATUS_EMPTY; }
+    if (value == hedge_task.STATUS_COALESCED) { ret task.STATUS_COALESCED; }
+    if (value == hedge_task.STATUS_BUSY)      { ret task.STATUS_BUSY; }
+    ret task.STATUS_INVALID;
+}
+
+fun outcome(value: hedge_task.Outcome) task.Outcome {
+    if (value == hedge_task.OUTCOME_COMPLETED) { ret task.OUTCOME_COMPLETED; }
+    if (value == hedge_task.OUTCOME_FAILED)    { ret task.OUTCOME_FAILED; }
+    if (value == hedge_task.OUTCOME_ABANDONED) { ret task.OUTCOME_ABANDONED; }
+    ret task.OUTCOME_NONE;
+}
+
+fun cause(value: hedge_task.Cause) task.Cause {
+    if (value == hedge_task.CAUSE_TRIGGER) { ret task.CAUSE_TRIGGER; }
+    ret task.CAUSE_PERIOD;
+}
+
+# laurel's durations are nanoseconds, and a spec that passed `spec_valid` has
+# none that is not positive
+fun nanoseconds(value: opt[duration.Duration]) u64 {
+    if (sel value.none)  { ret 0; }
+    if (value.some <= 0) { ret 0; }
+    ret value.some::u64;
+}
+
+fun past(deadline: opt[time.Instant]) bool {
+    if (sel deadline.none) { ret false; }
+    ret !time.instant_before(clock.instant(), deadline.some);
+}
+
+fun same_deadline(a: opt[time.Instant], b: opt[time.Instant]) bool {
+    if (sel a.none) { ret sel b.none; }
+    ret sel b.some && time.instant_equal(a.some, b.some);
+}
+
+fun step_failed(detail: view.View) service.Step {
+    ret service.Step{status: service.STEP_FAILED, detail: detail};
+}
+
+fun hedge_report(bridge: *Tasks, entry: *Entry, output: *hedge_task.Report) bool {
+    ret hedge_task.report(bridge.facility, entry.handle, output) == hedge_task.STATUS_OK;
+}
+
+# how the last run ended: hedge's answer, unless this bridge ended that run
+fun last_outcome(entry: *Entry, report: *hedge_task.Report) task.Outcome {
+    if (entry.ended_seq != 0 && entry.ended_seq == report.runs) { ret entry.ended; }
+    ret outcome(report.last);
+}
+
+fun end_run(entry: *Entry, sequence: u64, how: task.Outcome) {
+    entry.ended     = how;
+    entry.ended_seq = sequence;
+    entry.active    = false;
+    entry.cut       = false;
+}
+
+# every step of every laurel task, on hedge's task thread. a run that begins
+# after the drain is refused, and an admitted run cut off at the deadline is
+# ended, both without stepping laurel
+fun step(state: ptr, run: *hedge_task.Run) service.Step {
+    val entry:  *Entry = state::*Entry;
+    val bridge: *Tasks = entry.bridge;
+    lock(bridge);
+    if (entry.sequence != run.sequence) {
+        if (bridge.draining || bridge.stopped) {
+            var report: hedge_task.Report;
+            var last:   task.Outcome = task.OUTCOME_NONE;
+            if (hedge_report(bridge, entry, ?report)) { last = last_outcome(entry, ?report); }
+            entry.refused   = entry.refused + 1;
+            entry.ended     = last;
+            entry.ended_seq = run.sequence;
+            unlock(bridge);
+            ret step_failed(view.view("the application's tasks were drained", 36));
+        }
+        entry.sequence = run.sequence;
+        entry.active   = true;
+        entry.cut      = false;
+    }
+    if (entry.cut) {
+        entry.cuts = entry.cuts + 1;
+        end_run(entry, run.sequence, task.OUTCOME_ABANDONED);
+        unlock(bridge);
+        ret step_failed(view.view("the run overran the application's drain deadline", 49));
+    }
+    entry.stepping = true;
+    entry.current  = run;
+    entry.run      = task.Run{task: handle_of(entry), provider: ?bridge.provider,
+        scope:    run.scope, deadline: run.deadline, cause: cause(run.cause),
+        sequence: run.sequence, secrets: secret.Source{slot: 0, generation: 0}};
+    val laurel_step:  task.StepFun = entry.spec.step;
+    val laurel_state: ptr          = entry.spec.state;
+    unlock(bridge);
+    val answered: res[task.StepStatus, view.View] = laurel_step(laurel_state, ?entry.run);
+    lock(bridge);
+    entry.stepping = false;
+    entry.current  = nil;
+    var result: service.Step = service.Step{status: service.STEP_PENDING,
+        detail: view.view(nil, 0)};
+    if (sel answered.err) { result = step_failed(answered.err); }
+    or (sel answered.ok) {
+        if (answered.ok == task.STEP_DONE) {
+            result = service.Step{status: service.STEP_DONE, detail: view.view(nil, 0)};
+        }
+        or (answered.ok != task.STEP_PENDING) {
+            result = step_failed(view.view("invalid step result", 19));
+        }
+    }
+    if (result.status != service.STEP_PENDING) { entry.active = false; }
+    unlock(bridge);
+    ret result;
+}
+
+fun register_task(context: ptr, spec: *task.Spec, output: *task.Handle) task.Status {
+    val bridge: *Tasks = bridge_of(context);
+    if (bridge == nil || !task.spec_valid(spec) || output == nil) { ret task.STATUS_INVALID; }
+    lock(bridge);
+    if (bridge.stopped) {
+        unlock(bridge);
+        ret task.STATUS_INVALID;
+    }
+    if (bridge.draining) {
+        unlock(bridge);
+        ret task.STATUS_DRAINING;
+    }
+    if (bridge.count >= task.MAX_TASKS) {
+        unlock(bridge);
+        ret task.STATUS_FULL;
+    }
+    val entry: *Entry = ?bridge.entries[bridge.count];
+    entry.index     = bridge.count::u32;
+    entry.bridge    = bridge;
+    entry.spec      = @spec;
+    entry.current   = nil;
+    entry.sequence  = 0;
+    entry.active    = false;
+    entry.stepping  = false;
+    entry.cut       = false;
+    entry.cuts      = 0;
+    entry.refused   = 0;
+    entry.ended     = task.OUTCOME_NONE;
+    entry.ended_seq = 0;
+    var hedge_spec: hedge_task.Spec = hedge_task.Spec{name: spec.name, state: entry::ptr,
+        step:       step, period_ns: nanoseconds(spec.period),
+        timeout_ns: nanoseconds(spec.run_timeout), slots: spec.slots,
+        slot_bytes: spec.slot_bytes, slot_count: spec.slot_count};
+    val registered: hedge_task.Status = hedge_task.register(bridge.facility, ?hedge_spec,
+        ?entry.handle);
+    if (registered == hedge_task.STATUS_OK) {
+        entry.used   = true;
+        bridge.count = bridge.count + 1;
+        @output      = handle_of(entry);
+    }
+    unlock(bridge);
+    ret status(registered);
+}
+
+fun trigger_task(context: ptr, handle: task.Handle) task.Status {
+    val bridge: *Tasks = bridge_of(context);
+    if (bridge == nil) { ret task.STATUS_INVALID; }
+    lock(bridge);
+    val entry:  *Entry      = entry_of(bridge, handle);
+    var answer: task.Status = task.STATUS_INVALID;
+    if (entry != nil && !bridge.stopped) {
+        answer = task.STATUS_DRAINING;
+        if (!bridge.draining) { answer = status(hedge_task.trigger(bridge.facility, entry.handle)); }
+    }
+    unlock(bridge);
+    ret answer;
+}
+
+fun read_task(context: ptr, handle: task.Handle, output: *task.Lease) task.Status {
+    val bridge: *Tasks = bridge_of(context);
+    if (bridge == nil || output == nil) { ret task.STATUS_INVALID; }
+    lock(bridge);
+    val entry: *Entry = entry_of(bridge, handle);
+    if (entry == nil || bridge.stopped) {
+        unlock(bridge);
+        ret task.STATUS_INVALID;
+    }
+    var lease: hedge_task.Lease;
+    val read:  hedge_task.Status = hedge_task.read(bridge.facility, entry.handle, ?lease);
+    if (read == hedge_task.STATUS_OK) {
+        bridge.leases = bridge.leases + 1;
+        @output       = task.Lease{task: handle, slot: lease.slot, sequence: lease.sequence,
+            data: lease.data, len: lease.len};
+    }
+    unlock(bridge);
+    ret status(read);
+}
+
+fun release_task(context: ptr, lease: *task.Lease) task.Status {
+    val bridge: *Tasks = bridge_of(context);
+    if (bridge == nil || lease == nil) { ret task.STATUS_INVALID; }
+    lock(bridge);
+    val entry: *Entry = entry_of(bridge, lease.task);
+    if (entry == nil || bridge.stopped || bridge.leases == 0) {
+        unlock(bridge);
+        ret task.STATUS_INVALID;
+    }
+    var held: hedge_task.Lease = hedge_task.Lease{task: entry.handle, slot: lease.slot,
+        sequence: lease.sequence, data: lease.data, len: lease.len};
+    val released: hedge_task.Status = hedge_task.release(bridge.facility, ?held);
+    if (released == hedge_task.STATUS_OK) {
+        bridge.leases = bridge.leases - 1;
+        lease.data    = nil;
+        lease.len     = 0;
+    }
+    unlock(bridge);
+    ret status(released);
+}
+
+# the entry whose laurel run this is, while it is being stepped
+fun stepping_entry(bridge: *Tasks, run: *task.Run) *Entry {
+    if (run == nil) { ret nil; }
+    val entry: *Entry = entry_of(bridge, run.task);
+    if (entry == nil || !entry.stepping || entry.current == nil || run != ?entry.run) {
+        ret nil;
+    }
+    ret entry;
+}
+
+fun hedge_draft(entry: *Entry, pending: *task.Draft) hedge_task.Draft {
+    ret hedge_task.Draft{task: entry.handle, slot: pending.slot, sequence: pending.sequence,
+        data: pending.data, capacity: pending.capacity};
+}
+
+fun draft_task(context: ptr, run: *task.Run, output: *task.Draft) task.Status {
+    val bridge: *Tasks = bridge_of(context);
+    if (bridge == nil || output == nil) { ret task.STATUS_INVALID; }
+    lock(bridge);
+    val entry: *Entry = stepping_entry(bridge, run);
+    if (entry == nil) {
+        unlock(bridge);
+        ret task.STATUS_INVALID;
+    }
+    var claimed: hedge_task.Draft;
+    val drafted: hedge_task.Status = hedge_task.draft(entry.current, ?claimed);
+    if (drafted == hedge_task.STATUS_OK) {
+        @output = task.Draft{task: run.task, slot: claimed.slot, sequence: claimed.sequence,
+            data: claimed.data, capacity: claimed.capacity};
+    }
+    unlock(bridge);
+    ret status(drafted);
+}
+
+fun commit_task(context: ptr, run: *task.Run, pending: *task.Draft, len: usize) task.Status {
+    val bridge: *Tasks = bridge_of(context);
+    if (bridge == nil || pending == nil) { ret task.STATUS_INVALID; }
+    lock(bridge);
+    val entry: *Entry = stepping_entry(bridge, run);
+    if (entry == nil) {
+        unlock(bridge);
+        ret task.STATUS_INVALID;
+    }
+    var held:      hedge_task.Draft  = hedge_draft(entry, pending);
+    val committed: hedge_task.Status = hedge_task.commit(entry.current, ?held, len);
+    unlock(bridge);
+    ret status(committed);
+}
+
+fun discard_task(context: ptr, run: *task.Run, pending: *task.Draft) task.Status {
+    val bridge: *Tasks = bridge_of(context);
+    if (bridge == nil || pending == nil) { ret task.STATUS_INVALID; }
+    lock(bridge);
+    val entry: *Entry = stepping_entry(bridge, run);
+    if (entry == nil) {
+        unlock(bridge);
+        ret task.STATUS_INVALID;
+    }
+    var held:      hedge_task.Draft  = hedge_draft(entry, pending);
+    val discarded: hedge_task.Status = hedge_task.discard(entry.current, ?held);
+    unlock(bridge);
+    ret status(discarded);
+}
+
+fun copy_error(output: *task.Report, report: *hedge_task.Report) {
+    val error: view.View = hedge_task.report_error(report);
+    var i:     usize     = 0;
+    for (i < error.len && i < task.MAX_ERROR_BYTES) {
+        output.error[i] = error.data[i];
+        i               = i + 1;
+    }
+    output.error_len = i;
+}
+
+# hedge's report, less the runs this bridge refused, with the runs it cut off
+# counted as abandoned rather than failed
+fun report_task(context: ptr, handle: task.Handle, output: *task.Report) task.Status {
+    val bridge: *Tasks = bridge_of(context);
+    if (bridge == nil || output == nil) { ret task.STATUS_INVALID; }
+    lock(bridge);
+    val entry:  *Entry = entry_of(bridge, handle);
+    var report: hedge_task.Report;
+    if (entry == nil || bridge.stopped || !hedge_report(bridge, entry, ?report)) {
+        unlock(bridge);
+        ret task.STATUS_INVALID;
+    }
+    output.runs      = report.runs - entry.refused;
+    output.failures  = report.failed - entry.cuts - entry.refused;
+    output.abandoned = report.abandoned + entry.cuts;
+    output.last      = last_outcome(entry, ?report);
+    output.running   = report.running;
+    output.queued    = report.queued;
+    output.published = report.published;
+    copy_error(output, ?report);
+    unlock(bridge);
+    ret task.STATUS_OK;
+}
+
+# whether an admitted run is still in flight. a run hedge ended by itself, at
+# its own timeout or the process's drain deadline, is no longer
+fun in_flight(bridge: *Tasks, entry: *Entry) bool {
+    if (!entry.active) { ret false; }
+    var report: hedge_task.Report;
+    if (!hedge_report(bridge, entry, ?report) || !report.running
+        || report.runs != entry.sequence) {
+        entry.active = false;
+        entry.cut    = false;
+    }
+    ret entry.active;
+}
+
+# with the lock held: whether no admitted run is in flight, cutting off each
+# one that is not being stepped once the deadline has passed. `abandoned`
+# counts the runs abandoned at the deadline
+fun settle_locked(bridge: *Tasks, abandoned: *usize) bool {
+    val overdue: bool  = past(bridge.deadline);
+    var settled: bool  = true;
+    var count:   usize = 0;
+    var i:       usize = 0;
+    for (i < bridge.count) {
+        val entry: *Entry = ?bridge.entries[i];
+        if (in_flight(bridge, entry)) {
+            if (overdue && !entry.stepping) { entry.cut = true; }
+            or                              { settled = false; }
+        }
+        var report: hedge_task.Report;
+        if (hedge_report(bridge, entry, ?report)) {
+            count = count + (report.abandoned + entry.cuts)::usize;
+        }
+        if (entry.active && entry.cut) { count = count + 1; }
+        i = i + 1;
+    }
+    @abandoned = count;
+    ret settled;
+}
+
+fun drain_tasks(context: ptr, deadline: opt[time.Instant]) task.Drain {
+    val bridge: *Tasks = bridge_of(context);
+    if (bridge == nil) { ret task.Drain{status: task.DRAIN_INVALID, abandoned: 0}; }
+    lock(bridge);
+    if (bridge.stopped) {
+        unlock(bridge);
+        ret task.Drain{status: task.DRAIN_INVALID, abandoned: 0};
+    }
+    if (!bridge.draining) {
+        bridge.draining = true;
+        bridge.deadline = deadline;
+    }
+    or (!same_deadline(bridge.deadline, deadline)) {
+        unlock(bridge);
+        ret task.Drain{status: task.DRAIN_INVALID, abandoned: 0};
+    }
+    var abandoned: usize      = 0;
+    var drained:   task.Drain = task.Drain{status: task.DRAIN_PENDING, abandoned: 0};
+    if (settle_locked(bridge, ?abandoned)) { drained.status = task.DRAIN_DONE; }
+    drained.abandoned = abandoned;
+    unlock(bridge);
+    ret drained;
+}
+
+# gives the provider up. hedge's supervisor stops the facility itself, after
+# every hosted application has stopped
+fun stop_tasks(context: ptr) task.Status {
+    val bridge: *Tasks = bridge_of(context);
+    if (bridge == nil) { ret task.STATUS_INVALID; }
+    lock(bridge);
+    if (bridge.stopped) {
+        unlock(bridge);
+        ret task.STATUS_INVALID;
+    }
+    var abandoned: usize = 0;
+    if (!bridge.draining || bridge.leases != 0 || !settle_locked(bridge, ?abandoned)) {
+        unlock(bridge);
+        ret task.STATUS_BUSY;
+    }
+    bridge.stopped = true;
+    unlock(bridge);
+    ret task.STATUS_OK;
+}
+
+# makes the bridge over hedge's facility, which the process hands hedge in
+# `composition.Options.tasks`
+# ---
+# bridge:   storage for the bridge, which stays in place until the supervisor
+#           has stopped the facility
+# facility: hedge's task facility, made and not yet closed
+# ret:      whether the bridge was made
+pub fun make(bridge: *Tasks, facility: *hedge_task.Tasks) bool {
+    if (bridge == nil || facility == nil) { ret false; }
+    bridge.facility = facility;
+    bridge.provider = task.Provider{ctx: bridge::ptr, register: register_task,
+        trigger: trigger_task, read: read_task, release: release_task, draft: draft_task,
+        commit:  commit_task, discard: discard_task, report: report_task,
+        drain:   drain_tasks, stop: stop_tasks};
+    bridge.count    = 0;
+    bridge.leases   = 0;
+    bridge.lock     = mutex.make();
+    bridge.draining = false;
+    bridge.deadline = opt[time.Instant].none{};
+    bridge.stopped  = false;
+    bridge.valid    = true;
+    ret true;
+}
+
+# the laurel task provider the bridge is, for an application's provider set
+# under `task.key()`, or nil when it was never made
+pub fun provider(bridge: *Tasks) *task.Provider {
+    if (bridge == nil || !bridge.valid) { ret nil; }
+    ret ?bridge.provider;
+}
