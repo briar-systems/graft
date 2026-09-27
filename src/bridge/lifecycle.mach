@@ -1,0 +1,55 @@
+# the lifecycle bridge: hedge's supervisor drives a laurel application
+#
+# the supervisor starts the application before any worker binds a listener,
+# polls its readiness into the process's health, drains it toward the process's
+# drain deadline and stops it once the last worker has stopped. laurel's
+# transitions already answer pending rather than block, which is what a
+# supervisor step must do.
+
+use hedge.service;
+use laurel.app;
+use laurel.lifecycle;
+use std.chrono.time;
+use std.types.option.opt;
+
+fun step(result: lifecycle.Transition) service.Step {
+    if (result.status == lifecycle.TRANSITION_OK) {
+        ret service.Step{status: service.STEP_DONE, detail: result.error};
+    }
+    if (result.status == lifecycle.TRANSITION_PENDING) {
+        ret service.Step{status: service.STEP_PENDING, detail: result.error};
+    }
+    ret service.Step{status: service.STEP_FAILED, detail: result.error};
+}
+
+fun start(owner: ptr) service.Step {
+    ret step(app.start(owner::*app.App));
+}
+
+fun ready(owner: ptr) service.Step {
+    ret step(app.poll_ready(owner::*app.App));
+}
+
+fun drain(owner: ptr, deadline: time.Instant) service.Step {
+    ret step(app.drain(owner::*app.App, opt[time.Instant].some{deadline}));
+}
+
+# a stop that ran every component's stop still answers the failure that came
+# before it, which the supervisor reported when it happened, so it is done
+fun stop(owner: ptr) service.Step {
+    val application: *app.App             = owner::*app.App;
+    val result:      lifecycle.Transition = app.stop(application);
+    if (result.status == lifecycle.TRANSITION_FAILED && lifecycle.terminal(application.lifecycle)
+        && app.cleanup_failure(application).status == lifecycle.TRANSITION_OK) {
+        ret service.Step{status: service.STEP_DONE, detail: result.error};
+    }
+    ret step(result);
+}
+
+# the application's lifecycle components, bounded by its
+# `max_background_services`, as hedge's lifecycle hooks
+pub fun hooks(application: *app.App) service.Lifecycle {
+    if (application == nil || !application.valid) { ret service.no_lifecycle(); }
+    ret service.Lifecycle{ctx: application::ptr, start: start, ready: ready,
+        drain: drain, stop: stop};
+}

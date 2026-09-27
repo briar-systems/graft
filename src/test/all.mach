@@ -1,0 +1,6 @@
+# the test-only modules the library never reaches: `mach test . --lib tests`
+# runs their tests
+
+use std.runtime;
+
+use graft.test.serving;

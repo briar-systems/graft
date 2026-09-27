@@ -1,0 +1,390 @@
+# laurel applications hosted in hedge, through hedge's host contract
+#
+# `mount` registers an assembled application into a registry a program already
+# composes with. `run` is the whole program around one application: it loads
+# and seals the configuration, assembles the application against it, composes
+# the process, supervises it until a signal stops it, and answers the exit
+# status. `Process` is the same sequence in steps, for a program that drives
+# the supervisor itself.
+#
+# graft imports only the hedge items hedge's `doc/HOSTING.md` names as the host
+# contract, version 1.1.
+
+use graft.bridge.lifecycle;
+use graft.bridge.request;
+use hedge.composition;
+use hedge.config.loader;
+use hedge.config.schema;
+use hedge.connection;
+use hedge.generation;
+use hedge_lifecycle: hedge.lifecycle;
+use hedge.service;
+use hedge.spread;
+use hedge.supervisor;
+use http.core.message;
+use laurel.app;
+use std.allocator;
+use std.allocator.fixed;
+use std.allocator.page;
+use std.filesystem;
+use std.print;
+use std.process.env;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+pub val EXIT_OK:      i64 = 0;
+pub val EXIT_RUNTIME: i64 = 70;
+# the drain deadline passed with exchanges or a hosted drain still running
+pub val EXIT_DRAIN_INCOMPLETE: i64 = 75;
+pub val EXIT_CONFIG:           i64 = 78;
+
+# the arena each of the two configuration generation slots is built in
+pub val CONFIG_ARENA_BYTES: usize = 1048576;
+
+# register an assembled laurel application under `name`, with the request
+# bridge as its handler and the lifecycle bridge as its lifecycle. hedge's
+# supervisor starts it, so it is registered assembled and not yet started
+# ---
+# registry:     the registry the program hands `composition.Options.applications`
+# name:         the name the configuration's `application` routes to
+# application:  the assembled application, live until `supervisor.stop` returns
+# memory_bytes: the request memory each request may hold, 0 for the server's
+# ret:          whether it was registered
+pub fun mount(registry: *service.Applications, name: str, application: *app.App,
+    memory_bytes: usize) bool {
+    if (registry == nil || name == nil || application == nil || !application.valid) {
+        ret false;
+    }
+    ret service.register_hosted(registry, name, request.handler(application),
+        lifecycle.hooks(application), memory_bytes);
+}
+
+# what an application is assembled against once the configuration is sealed
+pub rec Setup {
+    # the name the application is registered under
+    name: str;
+    # the limits hedge commits every response under, which laurel's error
+    # rendering must not exceed
+    limits: message.Limits;
+}
+
+# assemble the application against the setup and answer it, not started, or
+# nil when it cannot be assembled
+pub def AssembleFun: fun(ptr, *Setup) *app.App;
+# release what the application holds once the process has stopped it
+pub def ReleaseFun: fun(ptr, *app.App) bool;
+
+# the application `run` hosts. its `ctx` and everything the assembled
+# application reaches live until `run` returns
+pub rec Application {
+    ctx:      ptr;
+    assemble: AssembleFun;
+    release:  ReleaseFun;
+    # the request memory each request may hold, 0 for the server's
+    memory_bytes: usize;
+}
+
+pub rec Options {
+    # the configuration file, read at start and again at every reload
+    path: str;
+    # the name the configuration's `application` routes to
+    name: str;
+    # the prefix of every line the process prints
+    label: str;
+    # answers the configuration's `${ENV:NAME}` references
+    resolver:     loader.Resolver;
+    capabilities: loader.Capabilities;
+    # hedge's own process options. `applications` is graft's
+    process: composition.Options;
+    # whether the supervisor takes SIGINT, SIGTERM and SIGHUP
+    signals: bool;
+}
+
+# the value's length, or -1 when the variable is unset or cannot be read
+fun resolve_environment(context: ptr, name: str, output: *u8, capacity: usize) i64 {
+    val got: res[opt[usize], env.EnvError] = env.get(name, output, capacity);
+    if (sel got.err)     { ret -1; }
+    if (sel got.ok.none) { ret -1; }
+    ret got.ok.some::i64;
+}
+
+# the options `run` uses: the process environment for references, the
+# capabilities of hedge's own executable, and signals taken
+pub fun options(path: str, name: str) Options {
+    ret Options{
+        path:     path,
+        name:     name,
+        label:    "graft",
+        resolver: loader.Resolver{context: nil, include: (0::usize)::loader.ResolveFun,
+            environment: resolve_environment},
+        capabilities: loader.Capabilities{quic: true, local_transport: true,
+            environment_secrets: true, file_secrets: true, os_secrets: false,
+            application_secrets: false},
+        process: composition.default_options(),
+        signals: true,
+    };
+}
+
+# one hosted process. it holds itself and hedge's records by address, so it
+# stays where it was made from `start` until `finish` returns
+pub rec Process {
+    heap:        *allocator.Allocator;
+    options:     Options;
+    application: Application;
+    assembled:   *app.App;
+    slots:       [1]service.Application;
+    registry:    service.Applications;
+    generations: [2]generation.Generation;
+    allocators:  [2]allocator.Allocator;
+    states:      [2]fixed.FixedState;
+    diagnostics: schema.Diagnostics;
+    composed:    composition.Runtime;
+    supervising: supervisor.Supervisor;
+    supervised:  bool;
+    serving:     bool;
+    # the exit status a start that did not serve settled on
+    refused: i64;
+}
+
+fun report_diagnostics(process: *Process) {
+    var i: usize = 0;
+    for (i < process.diagnostics.count) {
+        val item: *schema.Diagnostic = ?process.diagnostics.items[i];
+        print.eprint(process.options.label);
+        print.eprint(": ");
+        print.eprint(schema.text(?item.source));
+        print.eprint(": ");
+        print.eprint(schema.text(?item.path));
+        print.eprint(": ");
+        print.eprintln(schema.text(?item.message));
+        i = i + 1;
+    }
+    if (process.diagnostics.truncated) {
+        print.eprint(process.options.label);
+        print.eprintln(": diagnostics were truncated");
+    }
+}
+
+fun say(process: *Process, message: str) {
+    print.eprint(process.options.label);
+    print.eprint(": ");
+    print.eprintln(message);
+}
+
+# seal the configuration file into generation slot `target` under `id`, or nil
+fun seal(process: *Process, target: usize, id: u64) *generation.Generation {
+    val loaded: res[str, filesystem.FsError] = filesystem.read_string(process.heap,
+        process.options.path);
+    if (sel loaded.err) {
+        print.eprint(process.options.label);
+        print.eprint(": cannot read configuration ");
+        print.eprintln(process.options.path);
+        ret nil;
+    }
+    val candidate: *generation.Generation = ?process.generations[target];
+    fixed.reset(?process.states[target]);
+    schema.reset_diagnostics(?process.diagnostics);
+    if (!generation.make_candidate(candidate, id)) { ret nil; }
+    if (!loader.build(?candidate.graph, ?process.diagnostics, ?process.allocators[target],
+        process.options.path, loaded.ok, ?process.options.resolver,
+        process.options.capabilities)) {
+        report_diagnostics(process);
+        say(process, "the configuration is not valid");
+        ret nil;
+    }
+    if (!generation.seal(candidate, ?process.diagnostics, nil,
+        (0::usize)::generation.ConstructFun)) {
+        report_diagnostics(process);
+        say(process, "the configuration generation did not seal");
+        ret nil;
+    }
+    ret candidate;
+}
+
+# a reload seals into the slot the active generation is not using, and resolves
+# the application against the same registry, so it is never restarted
+fun load(context: ptr, id: u64, active: *generation.Generation) *generation.Generation {
+    val process: *Process = context::*Process;
+    var target:  usize    = 0;
+    if (active == ?process.generations[0]) { target = 1; }
+    ret seal(process, target, id);
+}
+
+fun refuse(process: *Process, code: i64, message: str) bool {
+    if (message != nil) { say(process, message); }
+    process.refused = code;
+    ret false;
+}
+
+# load and seal the configuration, assemble and mount the application, compose
+# the process and start it: the application first, then every worker
+# ---
+# process:     storage for the process, which stays in place until `finish`
+# heap:        the allocator hedge's records come from, live until `finish`
+# options:     the configuration and how it is read
+# application: the application to assemble and host
+# ret:         whether the process serves. either way, `finish` settles it
+pub fun start(process: *Process, heap: *allocator.Allocator, options: Options,
+    application: Application) bool {
+    if (process == nil || heap == nil) { ret false; }
+    process.heap        = heap;
+    process.options     = options;
+    process.application = application;
+    process.assembled   = nil;
+    process.supervised  = false;
+    process.serving     = false;
+    process.refused     = EXIT_RUNTIME;
+    if (options.path == nil || options.name == nil || options.label == nil
+        || application.assemble::usize == 0 || application.release::usize == 0) {
+        ret refuse(process, EXIT_RUNTIME, "the process options are incomplete");
+    }
+    val arena: res[*u8, allocator.Error] = allocator.allocate[u8](heap,
+        CONFIG_ARENA_BYTES * 2);
+    if (sel arena.err) { ret refuse(process, EXIT_RUNTIME, "startup allocation failed"); }
+    fixed.make(?process.allocators[0], ?process.states[0], arena.ok, CONFIG_ARENA_BYTES);
+    fixed.make(?process.allocators[1], ?process.states[1], ?arena.ok[CONFIG_ARENA_BYTES],
+        CONFIG_ARENA_BYTES);
+    val candidate: *generation.Generation = seal(process, 0, 1);
+    if (candidate == nil) { ret refuse(process, EXIT_CONFIG, nil); }
+
+    var setup: Setup = Setup{name: options.name,
+        limits: connection.message_limits(?candidate.graph,
+        connection.config_from(?candidate.graph))};
+    process.assembled = application.assemble(application.ctx, ?setup);
+    if (process.assembled == nil) {
+        ret refuse(process, EXIT_RUNTIME, "the application could not be assembled");
+    }
+    if (!service.make_applications(?process.registry, ?process.slots[0], 1)
+        || !mount(?process.registry, options.name, process.assembled,
+        application.memory_bytes)) {
+        ret refuse(process, EXIT_RUNTIME, "the application could not be registered");
+    }
+
+    var composing: composition.Options = options.process;
+    composing.applications = ?process.registry;
+    val workers: usize                   = spread.count(?candidate.graph);
+    val started: composition.StartReport = composition.start_process(?process.composed,
+        heap, ?candidate.graph, candidate.id, ?process.diagnostics, composing, workers);
+    if (started.status != composition.START_OK) {
+        report_diagnostics(process);
+        print.eprint(options.label);
+        print.eprint(": startup composition failed: ");
+        print.eprintln(started.detail);
+        if (started.status == composition.START_CONFIG) {
+            ret refuse(process, EXIT_CONFIG, nil);
+        }
+        ret refuse(process, EXIT_RUNTIME, nil);
+    }
+    if (!supervisor.make(?process.supervising, ?process.composed, heap, options.signals)
+        || !supervisor.attach_reloads(?process.supervising, candidate,
+        supervisor.Loader{context: process::ptr, load: load})) {
+        var unwound: composition.StopReport;
+        composition.close(?process.composed, ?unwound);
+        ret refuse(process, EXIT_RUNTIME,
+            "the supervisor could not take the process events");
+    }
+    process.supervised = true;
+
+    # the supervisor starts the application, then every worker, or none
+    val status: composition.StartStatus = supervisor.start(?process.supervising);
+    if (status == composition.START_CONFIG) { ret refuse(process, EXIT_CONFIG, nil); }
+    if (status != composition.START_OK)     { ret refuse(process, EXIT_RUNTIME, nil); }
+    process.serving = true;
+    print.print(options.label);
+    print.printlnf(": serving {} on {} workers", options.name, workers);
+    ret true;
+}
+
+# supervise until the process is asked to stop and every worker and the
+# application's drain have settled
+pub fun serve(process: *Process) {
+    if (process == nil || !process.serving) { ret; }
+    supervisor.run(?process.supervising);
+}
+
+# ask the process to stop, as SIGTERM does, from any thread
+pub fun request_stop(process: *Process) {
+    if (process == nil || !process.supervised) { ret; }
+    supervisor.request_stop(?process.supervising);
+}
+
+# ask the process to reload its configuration, as SIGHUP does, from any thread
+pub fun request_reload(process: *Process) {
+    if (process == nil || !process.supervised) { ret; }
+    supervisor.request_reload(?process.supervising);
+}
+
+# stop what started, the workers and then the application, release the
+# application, and answer the exit status
+pub fun finish(process: *Process) i64 {
+    if (process == nil) { ret EXIT_RUNTIME; }
+    var code: i64 = process.refused;
+    if (process.supervised) {
+        val stopped: composition.StopReport = supervisor.stop(?process.supervising);
+        process.supervised = false;
+        if (process.serving) {
+            code = EXIT_OK;
+            if (stopped.reason == hedge_lifecycle.DEADLINE) {
+                say(process, "the drain deadline passed with work still running");
+                code = EXIT_DRAIN_INCOMPLETE;
+            }
+            or (!stopped.stopped || stopped.reason == hedge_lifecycle.FAILED
+                || stopped.serve_failures != 0 || stopped.cleanup_failures != 0) {
+                say(process, "the process did not stop cleanly");
+                code = EXIT_RUNTIME;
+            }
+        }
+    }
+    process.serving = false;
+    if (process.assembled != nil) {
+        if (!process.application.release(process.application.ctx, process.assembled)) {
+            say(process, "the application did not release cleanly");
+            if (code == EXIT_OK) { code = EXIT_RUNTIME; }
+        }
+        process.assembled = nil;
+    }
+    if (code == EXIT_OK) {
+        print.print(process.options.label);
+        print.println(": stopped");
+    }
+    ret code;
+}
+
+# host one application for the whole process with these options
+pub fun run_with(options: Options, application: Application) i64 {
+    var heap: allocator.Allocator;
+    val made: err[allocator.Error] = page.make(?heap);
+    if (sel made.err) {
+        print.eprint(options.label);
+        print.eprintln(": page allocator initialization failed");
+        ret EXIT_RUNTIME;
+    }
+    val stored: res[*Process, allocator.Error] = allocator.zallocate[Process](?heap, 1);
+    if (sel stored.err) {
+        print.eprint(options.label);
+        print.eprintln(": startup allocation failed");
+        ret EXIT_RUNTIME;
+    }
+    val process: *Process = stored.ok;
+    if (start(process, ?heap, options, application)) { serve(process); }
+    ret finish(process);
+}
+
+# host one application for the whole process: the configuration at `path`,
+# routed to the application under `name`, served until SIGINT or SIGTERM
+# drains it
+# ---
+# path:        the hedge configuration file
+# name:        the name the configuration's `application` routes to
+# application: the application to assemble and host
+# ret:         the exit status: EXIT_OK, EXIT_CONFIG, EXIT_RUNTIME or
+#              EXIT_DRAIN_INCOMPLETE
+pub fun run(path: str, name: str, application: Application) i64 {
+    ret run_with(options(path, name), application);
+}

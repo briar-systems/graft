@@ -5,13 +5,50 @@ in-process in [hedge](https://github.com/briar-systems/hedge), as the reference
 binding on hedge's public host contract
 ([laurel#183](https://github.com/briar-systems/laurel/issues/183)).
 
+## Use
+
+```mach
+use graft.host;
+
+# assemble the laurel application against what hedge commits responses under,
+# and release it once hedge has drained and stopped it
+fun assemble(ctx: ptr, setup: *host.Setup) *app.App { ... }
+fun release(ctx: ptr, assembled: *app.App) bool { ... }
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    ret host.run("hedge.toml", "site", host.Application{ctx: nil,
+        assemble: assemble, release: release, memory_bytes: 65536});
+}
+```
+
+- `host.run(path, name, application)` is the whole program: it loads and seals
+  the configuration, assembles the application, mounts it under `name`,
+  composes the process, supervises it until SIGINT or SIGTERM drains it, and
+  answers the exit status (`EXIT_OK`, `EXIT_CONFIG` 78, `EXIT_RUNTIME` 70,
+  `EXIT_DRAIN_INCOMPLETE` 75). `host.run_with` takes `host.Options` for the
+  resolver, the capabilities, hedge's own process options and the log label.
+- `host.Process` is the same sequence in steps (`start`, `serve`,
+  `request_stop`, `request_reload`, `finish`), for a program that drives the
+  supervisor itself.
+- `host.mount(registry, name, application, memory_bytes)` registers an assembled
+  application into a registry a program already composes with.
+- `graft.bridge.request` and `graft.bridge.lifecycle` are the request bridge and
+  the lifecycle bridge `mount` registers.
+
+graft imports only the items hedge's `doc/HOSTING.md` names as the host
+contract (version 1.1). [`example/`](example) is a complete application served
+this way.
+
 ## Build
 
 ```sh
 mach dep pull .
 mach build .
-mach test . --timeout 5m
+mach test . --lib tests --timeout 5m
 ```
+
+The tests run a real process over a local socket, on Linux.
 
 ## Workflow
 

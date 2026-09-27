@@ -1,0 +1,510 @@
+# graft end to end: a real process, over a real socket
+#
+# each test runs the process `host.run` runs, through `host.Process`: the
+# configuration is read and sealed, the application is assembled, mounted and
+# started by hedge's supervisor, a worker serves on a thread of its own, and
+# this thread is only a client on an abstract local socket its process alone
+# names. nothing here reaches past hedge's host contract
+
+use graft.host;
+use graft.test.site;
+use hedge.clock;
+use laurel.app;
+use laurel.handler;
+use laurel.observability;
+use std.allocator;
+use std.allocator.page;
+use std.chrono.duration;
+use std.filesystem;
+use io_error:     std.io.error;
+use io_lifecycle: std.io.lifecycle;
+use local_socket: std.net.local;
+use local_types:  std.net.local.types;
+use std.sync.atomic;
+use std.sync.thread;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+val RESPONSE_BYTES: usize = 4096;
+# every wait is bounded by this many pauses of PAUSE_NS
+val ROUNDS:   usize = 500;
+val PAUSE_NS: i64   = 10000000;
+val READ_MS:  u64   = 50;
+
+val CONFIG_BYTES: usize = 2048;
+
+rec Harness {
+    heap:        allocator.Allocator;
+    process:     *host.Process;
+    site:        site.Site;
+    path:        [64]u8;
+    socket:      [64]u8;
+    socket_len:  usize;
+    target:      local_socket.Endpoint;
+    thread:      thread.Thread;
+    supervising: bool;
+}
+
+fun wait(value: *i64, at_least: i64) bool {
+    var rounds: usize = 0;
+    for (rounds < ROUNDS) {
+        if (atomic.load(value) >= at_least) { ret true; }
+        os.sleep(PAUSE_NS);
+        rounds = rounds + 1;
+    }
+    ret false;
+}
+
+# the application answered ready `polls` times, and has had a moment to open
+# admission after the last
+fun ready(harness: *Harness, polls: i64) bool {
+    if (!wait(?harness.site.phases.readies, polls)) { ret false; }
+    os.sleep(2 * PAUSE_NS);
+    ret true;
+}
+
+fun append(output: *u8, length: usize, text: str) usize {
+    var i: usize = 0;
+    for (text[i] != 0 && length + i + 1 < CONFIG_BYTES) {
+        output[length + i] = text[i];
+        i                  = i + 1;
+    }
+    output[length + i] = 0;
+    ret length + i;
+}
+
+fun append_number(output: *u8, capacity: usize, length: usize, value: u64) usize {
+    var digits: [20]u8;
+    var count:  usize = 0;
+    var rest:   u64   = value;
+    for (count == 0 || rest != 0) {
+        digits[count] = ('0'::u64 + rest % 10)::u8;
+        rest          = rest / 10;
+        count         = count + 1;
+    }
+    var at: usize = length;
+    for (count > 0 && at + 1 < capacity) {
+        count      = count - 1;
+        output[at] = digits[count];
+        at         = at + 1;
+    }
+    output[at] = 0;
+    ret at;
+}
+
+# this process's configuration file and abstract socket name, so tests running
+# at once never meet
+fun name(harness: *Harness) bool {
+    val pid: u64   = os.getpid()::u64;
+    var at:  usize = 0;
+    for ("out/graft-test-"[at] != 0) {
+        harness.path[at] = "out/graft-test-"[at];
+        at               = at + 1;
+    }
+    at = append_number(?harness.path[0], 64, at, pid);
+    var i: usize = 0;
+    for (".toml"[i] != 0) {
+        harness.path[at] = ".toml"[i];
+        at               = at + 1;
+        i                = i + 1;
+    }
+    harness.path[at] = 0;
+    at               = 0;
+    for ("@graft-test-"[at] != 0) {
+        harness.socket[at] = "@graft-test-"[at];
+        at                 = at + 1;
+    }
+    harness.socket_len = append_number(?harness.socket[0], 64, at, pid);
+    val target: res[local_socket.Endpoint, io_error.Error] = local_socket.abstract(
+        ?harness.socket[1], harness.socket_len - 1);
+    if (sel target.err) { ret false; }
+    harness.target = target.ok;
+    ret true;
+}
+
+# one worker on the local listener, every path routed to the service `app`,
+# and `app` routed to the application `routed`. `orders_only` narrows the
+# route to /orders/**, as a reload does
+fun write_config(harness: *Harness, routed: str, drain_ms: u64, orders_only: bool) bool {
+    var text:   [CONFIG_BYTES]u8;
+    var length: usize = 0;
+    length = append(?text[0], length, "[server]\nname = \"graft-test\"\nworkers = 1\n\n");
+    length = append(?text[0], length, "[server.timeouts]\ndrain_ms = ");
+    length = append_number(?text[0], CONFIG_BYTES, length, drain_ms);
+    length = append(?text[0], length, "\n\n[[listener]]\nname = \"public\"\naddress = \"");
+    length = append(?text[0], length, (?harness.socket[0])::str);
+    length = append(?text[0], length,
+        "\"\ntransport = \"local\"\nprotocols = [\"http/1.1\"]\n\n");
+    length = append(?text[0], length,
+        "[host.site]\nlistener = \"public\"\nserver_name = \"*\"\n\n");
+    length = append(?text[0], length, "[service.app]\nkind = \"laurel\"\napplication = \"");
+    length = append(?text[0], length, routed);
+    length = append(?text[0], length,
+        "\"\n\n[[route]]\nname = \"app\"\nhost = \"site\"\nservice = \"app\"\npath = \"");
+    if (orders_only) { length = append(?text[0], length, "/orders/**\"\n"); }
+    or               { length = append(?text[0], length, "/**\"\n"); }
+    val found: res[bool, io_error.Error] = filesystem.is_dir("out");
+    if (!((sel found.ok) && found.ok)) {
+        val created: err[io_error.Error] = filesystem.create_dir("out", 493);
+        if (sel created.err) { ret false; }
+    }
+    val written: err[filesystem.FsError] = filesystem.write_bytes(
+        (?harness.path[0])::str, ?text[0], length, 420);
+    ret sel written.ok;
+}
+
+fun assemble(ctx: ptr, setup: *host.Setup) *app.App {
+    val harness: *Harness = ctx::*Harness;
+    ret ?harness.site.application;
+}
+
+fun release(ctx: ptr, assembled: *app.App) bool {
+    ret site.release_site(?(ctx::*Harness).site);
+}
+
+fun supervise(arg: *u8) {
+    host.serve((arg::*Harness).process);
+}
+
+# the site assembled, and the process started on it and supervised from a
+# thread of its own. false when it did not come to serve
+fun boot(harness: *Harness, routed: str, drain_ms: u64, not_ready: usize, stuck: bool,
+    handler_timeout: opt[duration.Duration]) bool {
+    harness.supervising = false;
+    val made: err[allocator.Error] = page.make(?harness.heap);
+    if (sel made.err) { ret false; }
+    val stored: res[*host.Process, allocator.Error] =
+        allocator.zallocate[host.Process](?harness.heap, 1);
+    if (sel stored.err) { ret false; }
+    harness.process = stored.ok;
+    if (!name(harness) || !write_config(harness, routed, drain_ms, false)
+        || !site.assemble_site(?harness.site, not_ready, stuck, handler_timeout)) {
+        ret false;
+    }
+    var options: host.Options = host.options((?harness.path[0])::str, "site");
+    options.label = "graft-test";
+    if (!host.start(harness.process, ?harness.heap, options, host.Application{
+        ctx: harness::ptr, assemble: assemble, release: release, memory_bytes: 0
+    })) {
+        ret false;
+    }
+    val spawned: thread.Operation = thread.spawn_with(supervise, harness::*u8,
+        ?harness.thread);
+    if (sel spawned.err) {
+        host.request_stop(harness.process);
+        ret false;
+    }
+    harness.supervising = true;
+    ret true;
+}
+
+# ask the process to stop, join its supervisor, and answer its exit status
+fun finish(harness: *Harness) i64 {
+    if (harness.supervising) {
+        host.request_stop(harness.process);
+        thread.join(?harness.thread);
+        harness.supervising = false;
+    }
+    val code: i64 = host.finish(harness.process);
+    filesystem.remove_file((?harness.path[0])::str);
+    ret code;
+}
+
+fun connect(harness: *Harness, client: *local_types.Stream) bool {
+    val connected: res[local_types.Stream, io_error.Error] = local_socket.connect(
+        harness.target);
+    if (sel connected.err) { ret false; }
+    @client = connected.ok;
+    os.sock_set_rcvtimeo(client.handle, READ_MS);
+    ret true;
+}
+
+fun send(client: *local_types.Stream, text: str) bool {
+    val length:  usize                      = str_len(text);
+    val written: res[usize, io_error.Error] = local_socket.stream_write(client,
+        text::*u8, length);
+    ret (sel written.ok) && written.ok == length;
+}
+
+# read until the server closes or the budget is spent, answering the bytes read
+fun collect(client: *local_types.Stream, response: *u8) usize {
+    var total:  usize = 0;
+    var rounds: usize = 0;
+    for (rounds < ROUNDS && total + 1 < RESPONSE_BYTES) {
+        val read: res[usize, io_error.Error] = local_socket.stream_read(client,
+            ?response[total], RESPONSE_BYTES - total - 1);
+        if (sel read.ok) {
+            if (read.ok == 0) { brk; }
+            total = total + read.ok;
+        }
+        rounds = rounds + 1;
+    }
+    response[total] = 0;
+    ret total;
+}
+
+fun starts_with(data: *u8, length: usize, prefix: str) bool {
+    var i: usize = 0;
+    for (prefix[i] != 0) {
+        if (i >= length || data[i] != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun contains(data: *u8, length: usize, needle: str) bool {
+    val size:  usize = str_len(needle);
+    var start: usize = 0;
+    for (start + size <= length) {
+        var i: usize = 0;
+        for (i < size && data[start + i] == needle[i]) { i = i + 1; }
+        if (i == size) { ret true; }
+        start = start + 1;
+    }
+    ret false;
+}
+
+# one request on a connection of its own, and whether its response starts with
+# `expected`
+fun fetch(harness: *Harness, path: str, expected: str) bool {
+    var client: local_types.Stream;
+    if (!connect(harness, ?client)) { ret false; }
+    val sent: bool = send(?client, "GET ") && send(?client, path)
+        && send(?client, " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    var response: [RESPONSE_BYTES]u8;
+    var length:   usize = 0;
+    if (sent) { length = collect(?client, ?response[0]); }
+    local_socket.stream_close(?client, io_lifecycle.ABORTIVE);
+    ret starts_with(?response[0], length, expected);
+}
+
+val FORM_HEAD: str = "POST /submit HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 10\r\n\r\n";
+
+$if ($mach.build.os == $mach.os.linux) {
+    # a request reaches laurel through the request bridge and back, and laurel's
+    # request events describe it under hedge's trace id
+    test request__served_through_the_contract {
+        var harness: Harness;
+        if (!boot(?harness, "site", 1000, 0, false, opt[duration.Duration].none{})) { ret 1; }
+        val phases: *site.Phases = ?harness.site.phases;
+        val probe:  *site.Probe  = ?harness.site.probe;
+        val ready:  bool         = ready(?harness, 1);
+        val served: bool         = ready && fetch(?harness, "/greet", "HTTP/1.1 202");
+        val code:   i64          = finish(?harness);
+        if (!ready || !served)    { ret 2; }
+        if (code != host.EXIT_OK) { ret 3; }
+        if (probe.calls != 1 || probe.layers != 1 || probe.exits != 1
+            || probe.starts != 1 || probe.finishes != 1 || probe.errors != 0
+            || probe.route_len != 0 || probe.status != 202) { ret 4; }
+        if (probe.request_id != 32)                                   { ret 5; }
+        if (app.active_request_count(?harness.site.application) != 0) { ret 6; }
+        ret 0;
+    }
+
+    # laurel's own router decides every request: typed and wildcard parameters,
+    # the fallback, and a parameter its decoder refuses
+    test request__router_decides_every_request {
+        var harness: Harness;
+        if (!boot(?harness, "site", 1000, 0, false, opt[duration.Duration].none{})) { ret 1; }
+        val probe: *site.Probe = ?harness.site.probe;
+        val ready: bool        = ready(?harness, 1);
+        val order: bool        = ready && fetch(?harness, "/orders/42", "HTTP/1.1 200");
+        val named: bool        = site.same_text(?probe.route[0], probe.route_len, "order")
+            && probe.order == 42;
+        val file:     bool = fetch(?harness, "/files/a/b", "HTTP/1.1 200");
+        val missing:  bool = fetch(?harness, "/missing", "HTTP/1.1 202");
+        val rejected: bool = fetch(?harness, "/orders/nope", "HTTP/1.1 400");
+        val code:     i64  = finish(?harness);
+        if (!ready || !order || !named)                                      { ret 2; }
+        if (!file || !site.same_text(?probe.file[0], probe.file_len, "a/b")) { ret 3; }
+        if (!missing || probe.calls != 1)                                    { ret 4; }
+        if (!rejected || probe.mapped != 400 || probe.order != 42)           { ret 5; }
+        if (code != host.EXIT_OK)                                            { ret 6; }
+        # every entered half of the chain left again, four times over
+        if (probe.starts != 4 || probe.finishes != 3 || probe.errors != 1
+            || probe.layers != 4 || probe.exits != probe.layers
+            || app.active_request_count(?harness.site.application) != 0) { ret 7; }
+        ret 0;
+    }
+
+    # a handler that suspends on a body arriving in pieces is entered once, and
+    # resumed for what arrives after, never restarted
+    test request__suspended_handler_entered_once {
+        var harness: Harness;
+        if (!boot(?harness, "site", 1000, 0, false, opt[duration.Duration].none{})) { ret 1; }
+        val probe:  *site.Probe = ?harness.site.probe;
+        var client: local_types.Stream;
+        if (!ready(?harness, 1) || !connect(?harness, ?client)) {
+            finish(?harness);
+            ret 2;
+        }
+        var response: [RESPONSE_BYTES]u8;
+        var length:   usize = 0;
+        val entered:  bool  = send(?client, FORM_HEAD) && wait(?probe.entries, 1);
+        if (entered && send(?client, "name=")) {
+            os.sleep(5 * PAUSE_NS);
+            if (send(?client, "alice")) { length = collect(?client, ?response[0]); }
+        }
+        local_socket.stream_close(?client, io_lifecycle.ABORTIVE);
+        val code: i64 = finish(?harness);
+        if (!entered) { ret 3; }
+        if (!starts_with(?response[0], length, "HTTP/1.1 200")
+            || !contains(?response[0], length, "alice")) { ret 4; }
+        if (atomic.load(?probe.entries) != 1 || probe.work != 1 || probe.resumes == 0
+            || probe.abandons != 0 || probe.settlement != handler.SETTLE_READY) { ret 5; }
+        if (probe.field_len != 1 || !site.same_text(?probe.value[0], probe.value_len, "alice")) {
+            ret 6;
+        }
+        if (probe.layers != 1 || probe.exits != 1 || probe.finishes != 1
+            || probe.errors != 0 || probe.status != 200) { ret 7; }
+        if (code != host.EXIT_OK || app.active_request_count(?harness.site.application) != 0) {
+            ret 8;
+        }
+        ret 0;
+    }
+
+    # a client that leaves while the handler waits on its body cancels the
+    # exchange, and the handler is abandoned with every exit half run
+    test request__abandoned_when_the_client_leaves {
+        var harness: Harness;
+        if (!boot(?harness, "site", 1000, 0, false, opt[duration.Duration].none{})) { ret 1; }
+        val probe:  *site.Probe = ?harness.site.probe;
+        var client: local_types.Stream;
+        if (!ready(?harness, 1) || !connect(?harness, ?client)) {
+            finish(?harness);
+            ret 2;
+        }
+        val entered: bool = send(?client, FORM_HEAD) && send(?client, "name=")
+            && wait(?probe.entries, 1);
+        local_socket.stream_close(?client, io_lifecycle.ABORTIVE);
+        val abandoned: bool = entered && wait(?probe.abandons, 1);
+        val code:      i64  = finish(?harness);
+        if (!entered)   { ret 3; }
+        if (!abandoned) { ret 4; }
+        if (probe.work != 0 || probe.exits != 1
+            || probe.settlement != handler.SETTLE_ABANDONED) { ret 5; }
+        # one terminal event, describing a cancelled request
+        if (probe.outcome != observability.OUTCOME_CANCELLED) { ret 6; }
+        if (code != host.EXIT_OK || app.active_request_count(?harness.site.application) != 0) {
+            ret 7;
+        }
+        ret 0;
+    }
+
+    val HANDLER_DEADLINE_NS: i64 = 200000000;
+
+    # laurel narrows the request deadline to its handler deadline, and the
+    # bridge parks with it and times the exchange out once it passes
+    test request__handler_deadline_times_out {
+        var harness: Harness;
+        if (!boot(?harness, "site", 1000, 0, false,
+            opt[duration.Duration].some{HANDLER_DEADLINE_NS * duration.NANOSECOND})) { ret 1; }
+        val probe:  *site.Probe = ?harness.site.probe;
+        var client: local_types.Stream;
+        if (!ready(?harness, 1) || !connect(?harness, ?client)) {
+            finish(?harness);
+            ret 2;
+        }
+        # the body never arrives, so the handler waits on it until its deadline
+        val begun:    u64   = clock.monotonic_ns();
+        var response: [RESPONSE_BYTES]u8;
+        var length:   usize = 0;
+        val entered:  bool  = send(?client, FORM_HEAD) && wait(?probe.entries, 1);
+        if (entered) { length = collect(?client, ?response[0]); }
+        val waited: u64 = clock.monotonic_ns() - begun;
+        local_socket.stream_close(?client, io_lifecycle.ABORTIVE);
+        val code: i64 = finish(?harness);
+        if (!entered)                                              { ret 3; }
+        if (waited < HANDLER_DEADLINE_NS::u64)                     { ret 4; }
+        if (waited >= (ROUNDS::i64 * READ_MS::i64 * 1000000)::u64) { ret 5; }
+        if (atomic.load(?probe.entries) != 1 || probe.work != 0)   { ret 6; }
+        if (code != host.EXIT_OK || app.active_request_count(?harness.site.application) != 0) {
+            ret 7;
+        }
+        ret 0;
+    }
+
+    # a configuration that routes to a name nothing is registered under refuses
+    # the start as a configuration error, and an application hedge started
+    # before a worker found that out is stopped and released all the same
+    test mount__unregistered_name_is_a_config_error {
+        var harness: Harness;
+        if (boot(?harness, "elsewhere", 1000, 0, false, opt[duration.Duration].none{})) {
+            finish(?harness);
+            ret 1;
+        }
+        if (finish(?harness) != host.EXIT_CONFIG)                    { ret 2; }
+        if (harness.site.phases.starts != harness.site.phases.stops) { ret 3; }
+        if (harness.site.phases.releases != 1)                       { ret 4; }
+        ret 0;
+    }
+
+    # the supervisor starts the application before it serves, polls it ready,
+    # and on shutdown drains it before it stops it (hedge#393)
+    test lifecycle__started_ready_drained_stopped {
+        var harness: Harness;
+        if (!boot(?harness, "site", 1000, 1, false, opt[duration.Duration].none{})) { ret 1; }
+        val phases: *site.Phases = ?harness.site.phases;
+        val ready:  bool         = ready(?harness, 2);
+        val served: bool         = ready && fetch(?harness, "/orders/42", "HTTP/1.1 200");
+        val code:   i64          = finish(?harness);
+        if (!ready || !served)                                   { ret 2; }
+        if (phases.starts != 1 || phases.requests_at_start != 0) { ret 3; }
+        if (phases.drains != 1 || !phases.drained)               { ret 4; }
+        if (phases.stops != 1 || !phases.drained_at_stop)        { ret 5; }
+        if (phases.releases != 1 || code != host.EXIT_OK)        { ret 6; }
+        ret 0;
+    }
+
+    # a drain still pending at the drain deadline is abandoned, the application
+    # is stopped all the same, and the exit status says the drain did not finish
+    test lifecycle__drain_overrun_is_abandoned {
+        var harness: Harness;
+        if (!boot(?harness, "site", 200, 0, true, opt[duration.Duration].none{})) { ret 1; }
+        val phases: *site.Phases = ?harness.site.phases;
+        val ready:  bool         = ready(?harness, 1);
+        val code:   i64          = finish(?harness);
+        if (!ready)                                    { ret 2; }
+        if (code != host.EXIT_DRAIN_INCOMPLETE)        { ret 3; }
+        if (phases.drains < 2 || phases.drained)       { ret 4; }
+        if (phases.stops != 1 || phases.releases != 1) { ret 5; }
+        ret 0;
+    }
+
+    # a reload resolves the same registration again, and the application serves
+    # the new generation without being started a second time
+    test reload__resolves_the_same_application {
+        var harness: Harness;
+        if (!boot(?harness, "site", 1000, 0, false, opt[duration.Duration].none{})) { ret 1; }
+        val phases: *site.Phases = ?harness.site.phases;
+        val before: bool         = ready(?harness, 1)
+            && fetch(?harness, "/missing", "HTTP/1.1 202");
+        var after: bool = false;
+        if (before && write_config(?harness, "site", 1000, true)) {
+            host.request_reload(harness.process);
+            # the new generation routes /missing nowhere, so hedge answers it
+            var rounds: usize = 0;
+            for (!after && rounds < 100) {
+                after  = fetch(?harness, "/missing", "HTTP/1.1 404");
+                rounds = rounds + 1;
+                if (!after) { os.sleep(PAUSE_NS); }
+            }
+        }
+        val order: bool = after && fetch(?harness, "/orders/7", "HTTP/1.1 200");
+        val code:  i64  = finish(?harness);
+        if (!before)                                 { ret 2; }
+        if (!after)                                  { ret 3; }
+        if (!order || harness.site.probe.order != 7) { ret 4; }
+        if (phases.starts != 1 || phases.stops != 1) { ret 5; }
+        if (code != host.EXIT_OK)                    { ret 6; }
+        ret 0;
+    }
+}
