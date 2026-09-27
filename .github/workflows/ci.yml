@@ -6,6 +6,7 @@ name: CI
 
 on:
   pull_request:
+  # cd.yml runs the full tier through this, since a tag has no base branch
   workflow_call:
     inputs:
       heavy:
@@ -105,34 +106,6 @@ jobs:
         run: mach build example --profile release
       - if: matrix.leg.primary
         run: mach build . --all-targets --profile release
-      # a release run packages every executable for cd.yml, at the paths mach's
-      # build plan reports, so artifact names and suffixes come from mach.toml
-      - name: package
-        if: matrix.leg.primary && github.event_name == 'push'
-        run: |
-          set -euo pipefail
-          version=${GITHUB_REF_NAME#v}
-          mkdir dist
-          mach build . --all-targets --profile release --plan | awk '
-            /^unit / { name = $3; target = $6; goal = ""; os = "" }
-            $1 == "goal" { goal = $2 }
-            $1 == "tuple" { split($2, t, "-"); os = t[2] }
-            $1 == "out" && goal == "executable" { print name, target, os, $2 }' |
-          while read -r name target os path; do
-            archive="$PWD/dist/$name-$version-$target"
-            case "$os" in
-              windows) (cd "$(dirname "$path")" && zip -q "$archive.zip" "$(basename "$path")") ;;
-              *)       tar -czf "$archive.tar.gz" -C "$(dirname "$path")" "$(basename "$path")" ;;
-            esac
-          done
-          (cd dist && sha256sum * > SHA256SUMS)
-          ls dist
-      - if: matrix.leg.primary && github.event_name == 'push'
-        uses: actions/upload-artifact@v7
-        with:
-          name: dist
-          path: dist/*
-          if-no-files-found: error
 
   gate:
     if: always()
