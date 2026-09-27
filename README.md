@@ -34,10 +34,19 @@ fun main(argc: i64, argv: **u8) i64 {
 - `host.mount(registry, name, application, memory_bytes)` registers an assembled
   application into a registry a program already composes with.
 - `graft.bridge.request` and `graft.bridge.lifecycle` are the request bridge and
-  the lifecycle bridge `mount` registers.
+  the lifecycle bridge `mount` registers. The lifecycle bridge drains the task
+  provider the application's provider set resolves beside the application,
+  toward the same deadline, and stops it after the application.
+- `Setup.providers` is the provider entry graft supplies, for the application
+  to list in its `provider.Set`. It answers `laurel.task` with
+  `graft.bridge.task`, laurel's task provider over hedge's background tasks, so
+  the application's tasks run on the task thread hedge's supervisor owns. graft
+  makes that facility, or adapts the one a program passes in
+  `Options.process.tasks`. A program that calls `mount` itself makes a
+  `graft.bridge.task.Tasks` over the facility it hands hedge.
 
 graft imports only the items hedge's `doc/HOSTING.md` names as the host
-contract (version 1.1). [`example/`](example) is a complete application served
+contract (version 1.2). [`example/`](example) is a complete application served
 this way.
 
 ## Build
