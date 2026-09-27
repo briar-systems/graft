@@ -210,7 +210,7 @@ application is one service kind among several, and its configuration names it:
 
 ```toml
 [service.app]
-kind = "laurel"
+kind = "application"
 application = "site"
 ```
 
