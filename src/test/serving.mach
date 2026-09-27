@@ -10,8 +10,10 @@ use graft.host;
 use graft.test.site;
 use hedge.clock;
 use laurel.app;
+use laurel.config;
 use laurel.handler;
 use laurel.observability;
+use laurel.secret;
 use laurel.task;
 use std.allocator;
 use std.allocator.page;
@@ -19,9 +21,12 @@ use std.chrono.duration;
 use std.filesystem;
 use io_error:     std.io.error;
 use io_lifecycle: std.io.lifecycle;
+use std.log.record;
+use std.log.sink;
 use local_socket: std.net.local;
 use local_types:  std.net.local.types;
 use std.sync.atomic;
+use std.sync.mutex;
 use std.sync.thread;
 use std.system.os;
 use std.types.bool.bool;
@@ -34,29 +39,45 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 
-val RESPONSE_BYTES: usize = 4096;
+val RESPONSE_BYTES: usize = 16384;
 # every wait is bounded by this many pauses of PAUSE_NS
 val ROUNDS:   usize = 500;
 val PAUSE_NS: i64   = 10000000;
 val READ_MS:  u64   = 50;
 
-val CONFIG_BYTES: usize = 2048;
+val CONFIG_BYTES:  usize = 4096;
+val CAPTURE_BYTES: usize = 65536;
+
+# every log record the process writes, hosted code's among them
+rec Capture {
+    lock: mutex.Mutex;
+    data: [CAPTURE_BYTES]u8;
+    len:  usize;
+}
 
 rec Harness {
-    heap:        allocator.Allocator;
-    process:     *host.Process;
-    site:        site.Site;
-    path:        [64]u8;
-    socket:      [64]u8;
-    socket_len:  usize;
-    target:      local_socket.Endpoint;
-    thread:      thread.Thread;
-    supervising: bool;
+    heap:       allocator.Allocator;
+    process:    *host.Process;
+    site:       site.Site;
+    path:       [64]u8;
+    socket:     [64]u8;
+    socket_len: usize;
+    target:     local_socket.Endpoint;
+    # the providers test's secret file, administration socket and log capture
+    secret:       [64]u8;
+    admin:        [64]u8;
+    admin_len:    usize;
+    admin_target: local_socket.Endpoint;
+    capture:      Capture;
+    downstream:   sink.Sink;
+    thread:       thread.Thread;
+    supervising:  bool;
     # how the site is assembled once the host hands it its setup
     not_ready:       usize;
     stuck:           bool;
     handler_timeout: opt[duration.Duration];
     work:            bool;
+    provided:        bool;
 }
 
 fun wait(value: *i64, at_least: i64) bool {
@@ -133,13 +154,45 @@ fun name(harness: *Harness) bool {
         ?harness.socket[1], harness.socket_len - 1);
     if (sel target.err) { ret false; }
     harness.target = target.ok;
+    at             = append(?harness.secret[0], 0, "out/graft-secret-");
+    append_number(?harness.secret[0], 64, at, pid);
+    at                = append(?harness.admin[0], 0, "@graft-admin-");
+    harness.admin_len = append_number(?harness.admin[0], 64, at, pid);
+    val admin: res[local_socket.Endpoint, io_error.Error] = local_socket.abstract(
+        ?harness.admin[1], harness.admin_len - 1);
+    if (sel admin.err) { ret false; }
+    harness.admin_target = admin.ok;
     ret true;
 }
 
 # one worker on the local listener, every path routed to the service `app`,
 # and `app` routed to the application `routed`. `orders_only` narrows the
 # route to /orders/**, as a reload does
+# the site's secret and settings, an administration listener for its metrics,
+# and telemetry on, for the providers test
+fun append_provided(harness: *Harness, text: *u8, at: usize, greeting: str) usize {
+    var length: usize = at;
+    length = append(text, length, "\n[[listener]]\nname = \"admin\"\naddress = \"");
+    length = append(text, length, (?harness.admin[0])::str);
+    length = append(text, length,
+        "\"\ntransport = \"local\"\nprotocols = [\"http/1.1\"]\n\n[secret.token]\nprovider = \"file\"\nkey = \"");
+    length = append(text, length, (?harness.secret[0])::str);
+    length = append(text, length,
+        "\"\n\n[admin]\nenabled = true\nlistener = \"admin\"\nauth_secret = \"token\"\n\n");
+    length = append(text, length,
+        "[telemetry]\nlogs = true\nmetrics = true\nmetric_series = 128\n\n");
+    length = append(text, length,
+        "[application.site.secrets]\ntoken = \"token\"\n\n[application.site.settings]\ngreeting = \"");
+    length = append(text, length, greeting);
+    ret append(text, length, "\"\n");
+}
+
 fun write_config(harness: *Harness, routed: str, drain_ms: u64, orders_only: bool) bool {
+    ret write_greeting(harness, routed, drain_ms, orders_only, "hello");
+}
+
+fun write_greeting(harness: *Harness, routed: str, drain_ms: u64, orders_only: bool,
+    greeting: str) bool {
     var text:   [CONFIG_BYTES]u8;
     var length: usize = 0;
     length = append(?text[0], length, "[server]\nname = \"graft-test\"\nworkers = 1\n\n");
@@ -155,8 +208,9 @@ fun write_config(harness: *Harness, routed: str, drain_ms: u64, orders_only: boo
     length = append(?text[0], length, routed);
     length = append(?text[0], length,
         "\"\n\n[[route]]\nname = \"app\"\nhost = \"site\"\nservice = \"app\"\npath = \"");
-    if (orders_only) { length = append(?text[0], length, "/orders/**\"\n"); }
-    or               { length = append(?text[0], length, "/**\"\n"); }
+    if (orders_only)      { length = append(?text[0], length, "/orders/**\"\n"); }
+    or                    { length = append(?text[0], length, "/**\"\n"); }
+    if (harness.provided) { length = append_provided(harness, ?text[0], length, greeting); }
     val found: res[bool, io_error.Error] = filesystem.is_dir("out");
     if (!((sel found.ok) && found.ok)) {
         val created: err[io_error.Error] = filesystem.create_dir("out", 493);
@@ -170,7 +224,7 @@ fun write_config(harness: *Harness, routed: str, drain_ms: u64, orders_only: boo
 fun assemble(ctx: ptr, setup: *host.Setup) *app.App {
     val harness: *Harness = ctx::*Harness;
     if (!site.assemble_site(?harness.site, setup.providers, harness.not_ready, harness.stuck,
-        harness.handler_timeout, harness.work)) { ret nil; }
+        harness.handler_timeout, harness.work, harness.provided)) { ret nil; }
     ret ?harness.site.application;
 }
 
@@ -199,6 +253,10 @@ fun boot(harness: *Harness, routed: str, drain_ms: u64, not_ready: usize, stuck:
     harness.handler_timeout = handler_timeout;
     var options: host.Options = host.options((?harness.path[0])::str, "site");
     options.label = "graft-test";
+    if (harness.provided) {
+        if (!capture(harness)) { ret false; }
+        options.process.telemetry.downstream = ?harness.downstream;
+    }
     if (!host.start(harness.process, ?harness.heap, options, host.Application{
         ctx: harness::ptr, assemble: assemble, release: release, memory_bytes: 0
     })) {
@@ -223,7 +281,56 @@ fun finish(harness: *Harness) i64 {
     }
     val code: i64 = host.finish(harness.process);
     filesystem.remove_file((?harness.path[0])::str);
+    if (harness.provided) { filesystem.remove_file((?harness.secret[0])::str); }
     ret code;
+}
+
+fun capture_publish(context: ptr, data: *u8, length: usize) sink.WriteReport {
+    val capture: *Capture = context::*Capture;
+    mutex.lock(?capture.lock);
+    if (capture.len + length + 1 > CAPTURE_BYTES) {
+        mutex.unlock(?capture.lock);
+        ret sink.failed(length, 0, sink.SinkError.too_large{length});
+    }
+    var i: usize = 0;
+    for (i < length) {
+        capture.data[capture.len + i] = data[i];
+        i                             = i + 1;
+    }
+    capture.len               = capture.len + length;
+    capture.data[capture.len] = 0;
+    mutex.unlock(?capture.lock);
+    ret sink.persisted(length);
+}
+
+# the log capture, and the secret file the configuration grants the site
+fun capture(harness: *Harness) bool {
+    harness.capture.lock = mutex.make();
+    harness.capture.len  = 0;
+    harness.downstream   = sink.Sink{ctx: (?harness.capture)::ptr,
+        f_publish:           capture_publish, contract: sink.Contract{
+        delivery:            sink.DELIVERY_DIRECT, max_record: 2048,
+        oversize:            record.OVERSIZE_REJECT, adapter: sink.ADAPTER_CUSTOM,
+        target_atomic_limit: 0, queue_capacity: 0, overload: sink.OVERLOAD_REJECT_NEW
+    }};
+    val written: err[filesystem.FsError] = filesystem.write_bytes(
+        (?harness.secret[0])::str, site.SECRET::*u8, 6, 384);
+    ret sel written.ok;
+}
+
+# whether the log capture holds both texts, waiting for them
+fun logged(harness: *Harness, first: str, second: str) bool {
+    var rounds: usize = 0;
+    for (rounds < ROUNDS) {
+        mutex.lock(?harness.capture.lock);
+        val found: bool = contains(?harness.capture.data[0], harness.capture.len, first)
+            && contains(?harness.capture.data[0], harness.capture.len, second);
+        mutex.unlock(?harness.capture.lock);
+        if (found) { ret true; }
+        os.sleep(PAUSE_NS);
+        rounds = rounds + 1;
+    }
+    ret false;
 }
 
 fun connect(harness: *Harness, client: *local_types.Stream) bool {
@@ -292,6 +399,24 @@ fun fetch(harness: *Harness, path: str, expected: str) bool {
     if (sent) { length = collect(?client, ?response[0]); }
     local_socket.stream_close(?client, io_lifecycle.ABORTIVE);
     ret starts_with(?response[0], length, expected);
+}
+
+# whether the process's metrics, scraped from its administration listener,
+# hold `needle`
+fun scraped(harness: *Harness, needle: str) bool {
+    var client:    local_types.Stream;
+    val target:    local_socket.Endpoint                   = harness.admin_target;
+    val connected: res[local_types.Stream, io_error.Error] = local_socket.connect(target);
+    if (sel connected.err) { ret false; }
+    client = connected.ok;
+    os.sock_set_rcvtimeo(client.handle, READ_MS);
+    val sent: bool = send(?client, "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer ")
+        && send(?client, site.SECRET) && send(?client, "\r\nConnection: close\r\n\r\n");
+    var response: [RESPONSE_BYTES]u8;
+    var length:   usize = 0;
+    if (sent) { length = collect(?client, ?response[0]); }
+    local_socket.stream_close(?client, io_lifecycle.ABORTIVE);
+    ret starts_with(?response[0], length, "HTTP/1.1 200") && contains(?response[0], length, needle);
 }
 
 val FORM_HEAD: str = "POST /submit HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 10\r\n\r\n";
@@ -513,6 +638,52 @@ $if ($mach.build.os == $mach.os.linux) {
         if (!order || harness.site.probe.order != 7) { ret 4; }
         if (phases.starts != 1 || phases.stops != 1) { ret 5; }
         if (code != host.EXIT_OK)                    { ret 6; }
+        ret 0;
+    }
+
+    # the site borrows the secret hedge grants it, reads its settings before and
+    # after a reload moves them, and its signals reach hedge's metrics and log
+    # attributed to it, with its request span under hedge's trace
+    test providers__secret_settings_and_telemetry_through_hedge {
+        var harness: Harness;
+        harness.provided = true;
+        if (!boot(?harness, "site", 1000, 0, false, opt[duration.Duration].none{})) { ret 1; }
+        val provided: *site.Provided = ?harness.site.provided;
+        val first:    bool           = ready(?harness, 1)
+            && fetch(?harness, "/missing", "HTTP/1.1 202");
+        val before: bool = first && provided.read == config.READ_FOUND
+            && site.same_text(?provided.setting[0], provided.setting_len, "hello");
+        val borrowed: bool = first && provided.borrowed == secret.BORROW_OK && provided.matched;
+        # the reload step moves the site's settings to the new generation
+        var after: bool = false;
+        if (first && write_greeting(?harness, "site", 1000, false, "howdy")) {
+            host.request_reload(harness.process);
+            var rounds: usize = 0;
+            for (!after && rounds < 100) {
+                after = fetch(?harness, "/missing", "HTTP/1.1 202")
+                    && provided.read == config.READ_FOUND
+                    && site.same_text(?provided.setting[0], provided.setting_len, "howdy");
+                rounds = rounds + 1;
+                if (!after) { os.sleep(PAUSE_NS); }
+            }
+        }
+        # three orders counted for every time the fallback ran
+        var series: [64]u8;
+        var at:     usize = append(?series[0], 0, "app_orders_total{application=\"site\"} ");
+        at = append_number(?series[0], 64, at, 3 * atomic.load(?provided.uses)::u64);
+        append(?series[0], at, "\n");
+        val counted: bool = first && scraped(?harness, (?series[0])::str);
+        val event:   bool = first && logged(?harness, "order_placed", "application=\"site\"");
+        val span:    bool = first && logged(?harness, "span=\"laurel.request\"", "trace_id=");
+        val code:    i64  = finish(?harness);
+        if (!first)                                    { ret 2; }
+        if (!before)                                   { ret 3; }
+        if (!borrowed)                                 { ret 4; }
+        if (!after || harness.site.phases.starts != 1) { ret 5; }
+        if (!counted)                                  { ret 6; }
+        if (!event)                                    { ret 7; }
+        if (!span)                                     { ret 8; }
+        if (code != host.EXIT_OK)                      { ret 9; }
         ret 0;
     }
 
