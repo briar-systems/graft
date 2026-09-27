@@ -1,0 +1,223 @@
+# the request bridge: one hedge call served by one laurel application
+#
+# hedge calls the handler once for each entry of a request routed to the
+# application. the first entry routes, binds and executes the request in laurel,
+# and a request that suspends on its body parks the call and is resumed, never
+# restarted, on each later entry. its state lives in the request arena and is
+# found again through the call's finalizer slot, and the finalizer hands the
+# request back to laurel however the exchange settled.
+
+use hedge.clock;
+use hedge.dispatch.call;
+use hedge.service;
+use hedge.telemetry.trace;
+use http.core.exchange;
+use http.core.message;
+use laurel.app;
+use laurel.context;
+use laurel.middleware;
+use laurel.observability;
+use laurel.router;
+use A: std.allocator;
+use std.chrono.time;
+use std.sync.cancel;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view;
+
+# the request identifier is the hedge trace id in hex, so laurel's request
+# events and hedge's own log describe the same request
+pub val REQUEST_ID_BYTES: usize = 32;
+
+# one exchange's laurel state, allocated from the request arena. the execution
+# is laurel's cursor across suspensions, so it outlives the entry that started it
+rec RequestState {
+    application: *app.App;
+    terminal:    router.Terminal;
+    context:     context.Context;
+    recorder:    observability.Recorder;
+    execution:   middleware.Execution;
+    outcome:     middleware.Outcome;
+    identifier:  [REQUEST_ID_BYTES]char;
+    # the earlier of the exchange's deadline and the application's handler
+    # deadline, absolute monotonic. laurel narrows it and the host enforces it
+    deadline:     time.Instant;
+    has_deadline: bool;
+    bound:        bool;
+}
+
+# a handler past its deadline is timed out through the exchange scope, so the
+# step that resumes it abandons instead
+fun enforce_deadline(state: *RequestState, active: *call.Call) {
+    if (!state.has_deadline)                                  { ret; }
+    if (time.instant_before(clock.instant(), state.deadline)) { ret; }
+    val scope: *cancel.Scope = call.scope(active);
+    if (scope != nil) { cancel.timeout(scope); }
+}
+
+fun finalize_request(owner: ptr, active: *call.Call) bool {
+    if (owner == nil || active == nil || active.exchange == nil) { ret false; }
+    val state: *RequestState = owner::*RequestState;
+    if (!state.bound) { ret true; }
+    val active_scope: *cancel.Scope = call.scope(active);
+    if (state.application == nil || active_scope == nil) { ret false; }
+    # the exchange is going away while a step still holds it: every middleware
+    # exit half that is owed runs here, since a context that still owns an
+    # execution refuses to unbind
+    if (middleware.suspended(?state.execution)) {
+        state.outcome = app.abandon(state.application, ?state.execution,
+            ?state.context);
+    }
+    val released: bool = app.release_context(state.application, ?state.context,
+        app.Termination{outcome: state.outcome, reason: cancel.reason(active_scope),
+        status:   active.exchange.completion.status,
+        transfer: active.exchange.completion, finished: clock.instant()});
+    state.bound = false;
+    ret released;
+}
+
+fun hex_digit(value: u8) char {
+    if (value < 10) { ret ('0'::u8 + value)::char; }
+    ret ('a'::u8 + value - 10)::char;
+}
+
+fun render_request_id(source: *trace.Context, output: *char) bool {
+    if (source == nil || output == nil) { ret false; }
+    var i:          usize = 0;
+    var difference: u8    = 0;
+    for (i < 16) {
+        val byte: u8 = source.trace_id[i];
+        difference        = difference | byte;
+        output[i * 2]     = hex_digit(byte >> 4);
+        output[i * 2 + 1] = hex_digit(byte & 0x0f);
+        i                 = i + 1;
+    }
+    ret difference != 0;
+}
+
+# a rendered error is a complete response, and an unmapped one is not
+fun status_for(outcome: middleware.Outcome) exchange.ServiceStatus {
+    if (outcome.status == middleware.EXECUTION_RESPOND ||
+        outcome.status == middleware.EXECUTION_ERROR_RENDERED) {
+        ret exchange.SERVICE_COMPLETE;
+    }
+    ret exchange.SERVICE_FAILED;
+}
+
+# the outcome laurel reached is the response's fate. a pending outcome is a
+# handler waiting on body the connection has yet to deliver, so the call parks
+# until it arrives or the deadline passes
+fun settle(state: *RequestState, active: *call.Call) exchange.ServiceStatus {
+    if (state.outcome.status == middleware.EXECUTION_PENDING) {
+        var deadline_ns: u64 = 0;
+        if (state.has_deadline) { deadline_ns = clock.to_ns(state.deadline); }
+        ret call.park(active, call.WAIT_BODY, deadline_ns);
+    }
+    val bound:  *exchange.Exchange     = active.exchange;
+    val served: exchange.ServiceStatus = status_for(state.outcome);
+    if (served != exchange.SERVICE_COMPLETE) { ret served; }
+    if (bound.response.committed) {
+        if (!call.resolve_body(active, call.BODY_DRAIN)) {
+            ret exchange.SERVICE_FAILED;
+        }
+    }
+    or (bound.response.body_kind == message.BODY_NONE) {
+        if (service.commit_bodyless(active, call.BODY_DRAIN)
+            != exchange.SERVICE_COMPLETE) { ret exchange.SERVICE_FAILED; }
+    }
+    or (!call.resolve_body(active, call.BODY_DRAIN)
+        || service.commit(active) != message.RESPONSE_OK) {
+        ret exchange.SERVICE_FAILED;
+    }
+    ret served;
+}
+
+# re-enter the suspended step, and only it, so the handler does its work once
+# however many times it suspends. a scope that died while the request waited
+# abandons here rather than resuming
+fun resume_request(state: *RequestState,
+    active: *call.Call) exchange.ServiceStatus {
+    if (!state.bound || state.application == nil
+        || !middleware.suspended(?state.execution)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    enforce_deadline(state, active);
+    state.outcome = app.resume(state.application, ?state.execution,
+        ?state.context);
+    ret settle(state, active);
+}
+
+fun start_request(application: *app.App, active: *call.Call,
+    bound: *exchange.Exchange, arena: *A.Allocator) exchange.ServiceStatus {
+    val allocated: res[*RequestState, A.Error] =
+        A.zallocate[RequestState](arena, 1);
+    if (sel allocated.err) {
+        ret exchange.SERVICE_FAILED;
+    }
+    val state: *RequestState = allocated.ok;
+    state.application = application;
+    if (!render_request_id(active.telemetry, ?state.identifier[0])) {
+        ret exchange.SERVICE_FAILED;
+    }
+    # the finalizer tears the request down and is how the next entry finds this
+    # state again, so it is attached before anything laurel owns is bound
+    if (!call.attach_finalizer(active, call.Finalizer{
+        ctx: state::ptr, finish: finalize_request
+    })) {
+        ret exchange.SERVICE_FAILED;
+    }
+    state.terminal = router.terminal(application.router, application.fallback,
+        router.dispatch(application.router, bound.request, arena));
+    var params: context.Params = context.Params{items: nil, len: 0,
+        generation: bound.generation};
+    var route_name: view.View = view.view(nil, 0);
+    if (state.terminal.matched.status == router.DISPATCH_MATCH) {
+        params     = state.terminal.matched.params;
+        route_name = service.text_view(
+            application.router.routes[state.terminal.matched.route].name);
+    }
+    if (!app.bind_context(application, ?state.context, ?state.recorder,
+        app.Admission{exchange: bound, params: params, allocator: arena,
+        request_id: view.View{data: ?state.identifier[0],
+        len:        REQUEST_ID_BYTES},
+        route_name: route_name, started: clock.instant()})) {
+        ret exchange.SERVICE_FAILED;
+    }
+    state.bound        = true;
+    state.has_deadline = context.deadline(?state.context, ?state.deadline);
+    state.outcome      = app.execute(application, ?state.execution,
+        router.terminal_handler(?state.terminal), ?state.context);
+    ret settle(state, active);
+}
+
+# the handler hedge enters for every request routed to the application, with
+# the application as its context
+pub fun serve(owner: ptr, active: *call.Call) exchange.ServiceStatus {
+    if (owner == nil || active == nil || !call.entered(active)) {
+        ret exchange.SERVICE_FAILED;
+    }
+    val application: *app.App           = owner::*app.App;
+    val bound:       *exchange.Exchange = active.exchange;
+    val arena:       *A.Allocator       = call.allocator_of(active);
+    if (!application.valid || bound == nil || arena == nil) {
+        ret exchange.SERVICE_FAILED;
+    }
+    # an exchange that already reached laurel is resumed, never dispatched,
+    # bound or executed a second time
+    val started: ptr = call.finalizer_state(active, finalize_request);
+    if (started != nil) {
+        ret resume_request(started::*RequestState, active);
+    }
+    if (call.cancelled(active)) { ret exchange.SERVICE_FAILED; }
+    ret start_request(application, active, bound, arena);
+}
+
+# the application's handler: its own router and fallback decide every request
+pub fun handler(application: *app.App) service.Handler {
+    if (application == nil || !application.valid) { ret service.no_handler(); }
+    ret service.Handler{ctx: application::ptr, serve: serve};
+}
