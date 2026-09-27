@@ -4,6 +4,7 @@
 # fallback, one middleware, an error mapper and one lifecycle component, every
 # part of it borrowed from the one Site record
 
+use hedge.clock;
 use http.core.exchange;
 use http.core.message;
 use http.core.method;
@@ -21,10 +22,12 @@ use laurel.provider;
 use laurel.render;
 use laurel.router;
 use laurel.security;
+use laurel.task;
 use A: std.allocator;
 use std.chrono.duration;
 use std.chrono.time;
 use std.sync.atomic;
+use std.sync.cancel;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -63,6 +66,53 @@ pub rec Probe {
     request_id: usize;
 }
 
+# how long the task's run keeps going once drain has cancelled it
+pub val WORK_HOLD_NS: u64 = 150000000;
+
+# the site's one background task, registered when the application starts. its
+# run publishes a snapshot and then keeps going until drain cancels it, and
+# for WORK_HOLD_NS after, so the drain has a run in flight to wait for
+pub rec Work {
+    enabled:   bool;
+    providers: *provider.Set;
+    tasks:     *task.Provider;
+    handle:    task.Handle;
+    spec:      task.Spec;
+    slots:     [16]u8;
+    steps:     i64;
+    # when the run first saw its scope cancelled, on hedge's monotonic clock
+    cancelled_ns: u64;
+    finished:     i64;
+}
+
+fun work_step(state: ptr, run: *task.Run) res[task.StepStatus, view.View] {
+    val work: *Work = state::*Work;
+    if (atomic.fetch_add(?work.steps, 1) == 0
+        && task.publish(run, view.view("tick"::*char, 4)) != task.STATUS_OK) {
+        ret res[task.StepStatus, view.View].err{view.view("publish refused"::*char, 15)};
+    }
+    val reason: cancel.Reason = cancel.reason(run.scope);
+    if (!(sel reason.cancelled)) { ret res[task.StepStatus, view.View].ok{task.STEP_PENDING}; }
+    val now: u64 = clock.monotonic_ns();
+    if (work.cancelled_ns == 0) { work.cancelled_ns = now; }
+    if (now - work.cancelled_ns < WORK_HOLD_NS) {
+        ret res[task.StepStatus, view.View].ok{task.STEP_PENDING};
+    }
+    atomic.store(?work.finished, 1);
+    ret res[task.StepStatus, view.View].ok{task.STEP_DONE};
+}
+
+# register the task through the provider the host supplies, and run it now
+fun start_work(work: *Work) bool {
+    work.tasks = task.resolve(work.providers);
+    if (work.tasks == nil) { ret false; }
+    work.spec = task.Spec{name: view.view("work"::*char, 4), state: work::ptr, step: work_step,
+        period: opt[duration.Duration].none{}, run_timeout: opt[duration.Duration].none{},
+        slots:  ?work.slots[0], slot_bytes: 8, slot_count: 2};
+    ret task.register(work.tasks, ?work.spec, ?work.handle) == task.STATUS_OK
+        && task.trigger(work.tasks, work.handle) == task.STATUS_OK;
+}
+
 # the site's one lifecycle component, driven from the supervisor's thread
 pub rec Phases {
     probe: *Probe;
@@ -79,12 +129,18 @@ pub rec Phases {
     # requests the application had seen when it was started
     requests_at_start: i64;
     drained_at_stop:   bool;
+    work:              *Work;
+    # whether the task's run had finished when the application was stopped
+    worked_at_stop: bool;
 }
 
 fun phase_start(owner: ptr) res[lifecycle.CallbackStatus, view.View] {
     val phases: *Phases = owner::*Phases;
     phases.requests_at_start = atomic.load(?phases.probe.starts);
     atomic.fetch_add(?phases.starts, 1);
+    if (phases.work.enabled && !start_work(phases.work)) {
+        ret res[lifecycle.CallbackStatus, view.View].err{view.view("task refused"::*char, 12)};
+    }
     ret res[lifecycle.CallbackStatus, view.View].ok{lifecycle.CALLBACK_DONE};
 }
 
@@ -112,6 +168,7 @@ fun phase_drain(owner: ptr, deadline: opt[time.Instant])
 fun phase_stop(owner: ptr) res[lifecycle.CallbackStatus, view.View] {
     val phases: *Phases = owner::*Phases;
     phases.drained_at_stop = phases.drained;
+    phases.worked_at_stop  = atomic.load(?phases.work.finished) == 1;
     atomic.fetch_add(?phases.stops, 1);
     ret res[lifecycle.CallbackStatus, view.View].ok{lifecycle.CALLBACK_DONE};
 }
@@ -344,7 +401,9 @@ pub rec Site {
     router:         router.Router;
     layers:         [1]middleware.Middleware;
     middlewares:    middleware.Stack;
+    host:           [1]provider.Provider;
     providers:      provider.Set;
+    work:           Work;
     phases:         Phases;
     component:      lifecycle.Lifecycle;
     controller:     lifecycle.Controller;
@@ -355,13 +414,17 @@ pub rec Site {
 }
 
 # the site assembled and not yet started, since the host drives its lifecycle.
-# `not_ready`, `stuck` and the handler deadline are the test's to choose
-pub fun assemble_site(site: *Site, not_ready: usize, stuck: bool,
-    handler_timeout: opt[duration.Duration]) bool {
-    if (!provider.init(?site.providers, nil, 0, 0, 32)) { ret false; }
-    site.phases = Phases{probe: ?site.probe, not_ready: not_ready, stuck: stuck,
+# `not_ready`, `stuck`, the handler deadline and whether it runs its task are
+# the test's to choose. `host` is the provider entry its host supplies
+pub fun assemble_site(site: *Site, host: provider.Provider, not_ready: usize, stuck: bool,
+    handler_timeout: opt[duration.Duration], work: bool) bool {
+    site.host[0] = host;
+    if (!provider.init(?site.providers, ?site.host[0], 1, 1, 32)) { ret false; }
+    site.work.enabled   = work;
+    site.work.providers = ?site.providers;
+    site.phases         = Phases{probe: ?site.probe, not_ready: not_ready, stuck: stuck,
         starts:            0, readies: 0, drains: 0, stops: 0, drained: false, releases: 0,
-        requests_at_start: 0, drained_at_stop: false};
+        requests_at_start: 0, drained_at_stop: false, work: ?site.work, worked_at_stop: false};
     site.component = lifecycle.Lifecycle{ctx: ?site.phases, start: phase_start,
         ready: phase_ready, drain: phase_drain, stop: phase_stop};
     if (!lifecycle.init(?site.controller, ?site.component, 1, 1)) { ret false; }
@@ -412,7 +475,7 @@ pub fun assemble_site(site: *Site, not_ready: usize, stuck: bool,
             max_form_fields:         8, max_upload_bytes: 1024, max_route_params: 4,
             max_request_id_bytes:    64, max_active_requests: 2,
             max_middleware_depth:    8, handler_timeout: handler_timeout,
-            max_providers:           0, max_provider_key_bytes: 32,
+            max_providers:           1, max_provider_key_bytes: 32,
             max_background_services: 1}, trust_proxy: false,
             panic_policy:            middleware.PANIC_ABORT},
         router:   ?site.router, middleware: ?site.middlewares,
