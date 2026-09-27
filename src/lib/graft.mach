@@ -1,0 +1,4 @@
+# graft hosts laurel applications in-process in hedge, as the reference binding
+# on hedge's public host contract
+
+use std.runtime;

@@ -31,20 +31,12 @@ os  = "darwin"
 abi = "aapcs64"
 
 [artifact.graft]
-kind = "bin"
-entry = "bin/graft.mach"
-out = "bin/graft{artifact.suffix}"
+kind = "static"
+entry = "lib/graft.mach"
+out = "lib/graft"
 targets = ["*"]
-link = ["kernel32"]
+link = []
 need = []
-
-[link.kernel32]
-source = "system"
-name = "kernel32.dll"
-os = ["windows"]
-isa = ["*"]
-abi = ["*"]
-export = false
 
 [profile.debug]
 default = true
