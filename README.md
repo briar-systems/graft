@@ -76,16 +76,18 @@ Issues are labeled on independent axes:
 
 ## CI
 
-`.github/workflows/ci.yml` runs on pull requests. A pull request into `dev`
-builds and tests on `x86_64-linux`, and checks formatting and a release
-cross-build of every manifest target. A pull request into `main` also runs `aarch64-linux`,
-`x86_64-windows`, `aarch64-darwin` and `x86_64-darwin`. To run every leg on any
-branch, use `gh workflow run CI --ref <branch> -f heavy=all`.
+`.github/workflows/ci.yml` runs the org's shared `mach-lib.yml` on pull
+requests. A pull request into `dev` builds and tests on `x86_64-linux`, checks
+formatting, builds the example and cross-builds every manifest target in
+release. A pull request into `main` also runs `aarch64-linux`,
+`x86_64-windows`, `aarch64-darwin` and `x86_64-darwin`, and an `aarch64-linux`
+runner without FEAT_DIT runs the tests under `qemu-aarch64 -cpu max`. To run
+every leg on any branch, use `gh workflow run CI --ref <branch> -f heavy=all`.
 
 The last job, `gate`, is the check the branch rules require. It fails if any
-other job failed, or if a job is missing from its `needs`.
+other job failed.
 
-The compiler version is `MACH_VERSION` in `ci.yml`. Change it together with the
+The compiler version is `mach-version` in `ci.yml`. Change it together with the
 `mach` range in `mach.toml`.
 
 ## Releases
