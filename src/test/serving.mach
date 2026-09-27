@@ -145,7 +145,7 @@ fun write_config(harness: *Harness, routed: str, drain_ms: u64, orders_only: boo
         "\"\ntransport = \"local\"\nprotocols = [\"http/1.1\"]\n\n");
     length = append(?text[0], length,
         "[host.site]\nlistener = \"public\"\nserver_name = \"*\"\n\n");
-    length = append(?text[0], length, "[service.app]\nkind = \"laurel\"\napplication = \"");
+    length = append(?text[0], length, "[service.app]\nkind = \"application\"\napplication = \"");
     length = append(?text[0], length, routed);
     length = append(?text[0], length,
         "\"\n\n[[route]]\nname = \"app\"\nhost = \"site\"\nservice = \"app\"\npath = \"");

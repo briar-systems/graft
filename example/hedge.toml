@@ -1,8 +1,8 @@
 # hedge configuration for the graft example
 #
-# the service kind "laurel" tells hedge that this service is an application
-# hosted in-process rather than files or an upstream. `application` is the name
-# the executable hands `graft.host.run`, so the two strings must agree.
+# the service kind "application" tells hedge that this service is hosted
+# in-process rather than files or an upstream. the service's `application` is the
+# name the executable hands `graft.host.run`, so the two strings must agree.
 
 [server]
 name = "graft-example"
@@ -29,7 +29,7 @@ listener = "public"
 server_name = "*"
 
 [service.app]
-kind = "laurel"
+kind = "application"
 application = "site"
 
 # two services hedge answers itself, next to the application: a plain file
