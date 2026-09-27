@@ -2,3 +2,7 @@
 # on hedge's public host contract
 
 use std.runtime;
+
+fwd graft.host;
+fwd graft.bridge.request;
+fwd graft.bridge.lifecycle;
