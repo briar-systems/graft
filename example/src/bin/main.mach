@@ -1,0 +1,40 @@
+# the example executable: graft hosts the laurel application in hedge
+#
+# `host.run` reads and seals hedge.toml, assembles the application against it,
+# registers it under "site", and serves until SIGINT or SIGTERM drains it. hedge
+# starts, drains and stops the application, and `release` frees what it holds
+
+use example.app;
+use graft.host;
+use laurel_app: laurel.app;
+use laurel.security.csrf;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+var demo:  app.Application;
+var quiet: bool;
+# the csrf key ring is secret, so it lives here, reached by typed pointer, and
+# never inside what the application erases to `ptr`
+var csrf_keys: [1]csrf.KeyGeneration;
+var csrf_ring: csrf.KeyRing;
+
+fun assemble(ctx: ptr, setup: *host.Setup) *laurel_app.App {
+    if (!app.init_csrf(?demo, ?csrf_ring, ?csrf_keys[0])
+        || !app.assemble(?demo, setup.limits, quiet)) { ret nil; }
+    ret ?demo.application;
+}
+
+fun release(ctx: ptr, assembled: *laurel_app.App) bool {
+    ret app.release(?demo);
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var path: str = "hedge.toml";
+    if (argc > 1 && argv[1] != nil) { path = argv[1]::str; }
+    quiet = argc > 2 && argv[2] != nil && str_equals(argv[2]::str, "--quiet");
+    ret host.run(path, "site", host.Application{ctx: nil, assemble: assemble,
+        release: release, memory_bytes: 65536});
+}

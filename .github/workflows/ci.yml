@@ -96,6 +96,13 @@ jobs:
       - run: mach test . --lib tests --profile release --timeout 5m
       - if: matrix.leg.primary
         run: mach fmt --check .
+      # the example is its own project, served through graft
+      - if: matrix.leg.primary
+        run: mach fmt --check example
+      - if: matrix.leg.primary
+        run: mach dep pull example
+      - if: matrix.leg.primary
+        run: mach build example --profile release
       - if: matrix.leg.primary
         run: mach build . --all-targets --profile release
       # a release run packages every executable for cd.yml, at the paths mach's
