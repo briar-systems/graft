@@ -1,11 +1,15 @@
 # graft
 
+graft hosts [laurel](https://github.com/briar-systems/laurel) applications
+in-process in [hedge](https://github.com/briar-systems/hedge), as the reference
+binding on hedge's public host contract
+([laurel#183](https://github.com/briar-systems/laurel/issues/183)).
+
 ## Build
 
 ```sh
 mach dep pull .
 mach build .
-mach run .
 mach test . --timeout 5m
 ```
 
