@@ -1,6 +1,6 @@
 [project]
 id = "example"
-mach = "^6.3"
+mach = "^6.5"
 version = "0.1.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
@@ -49,11 +49,11 @@ path = "../"
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^9.3"
+version = "^9.4"
 
 [dep.laurel]
 git = "https://github.com/briar-systems/laurel"
-version = "^0.22"
+version = "^0.23"
 
 [dep.http]
 git = "https://github.com/briar-systems/mach-http"
