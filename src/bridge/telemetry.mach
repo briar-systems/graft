@@ -1,0 +1,213 @@
+# the telemetry bridge: laurel's telemetry sink over hedge's telemetry for
+# hosted code
+#
+# a laurel application's signals reach hedge's own metrics and log, attributed
+# to the application: a counter adds to, and a gauge sets, the series
+# `app_<name>` labelled with the application and the signal's labels, and an
+# event is a log record named after the signal. hedge bounds the series an
+# application registers, and a signal hedge refuses is dropped, since laurel's
+# sink answers nothing.
+#
+# the request bridge writes one record for each request laurel served, its
+# request span, under the trace hedge started for the request: hedge adds the
+# request's trace id, and the record's `parent_id` is hedge's span for it.
+
+use hedge.observe;
+use hedge.service;
+use hedge.telemetry.trace;
+use laurel.observability;
+use std.log.record;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+# a label's key or value, or a signal's name, with room for its terminator
+val TERM_CAPACITY: usize = observability.MAX_TERM_BYTES + 1;
+
+# caller-owned bridge state. it stays where it is made from `make` until the
+# process has stopped
+pub rec Telemetry {
+    source:    observe.Source;
+    telemetry: observability.Telemetry;
+    bound:     bool;
+    valid:     bool;
+}
+
+# a signal's name and labels, terminated as hedge takes them, with the labels
+# sorted by key
+rec Terms {
+    name:   [TERM_CAPACITY]u8;
+    keys:   [observability.MAX_LABELS][TERM_CAPACITY]u8;
+    values: [observability.MAX_LABELS][TERM_CAPACITY]u8;
+    order:  [observability.MAX_LABELS]usize;
+    count:  usize;
+}
+
+fun terminate(term: *observability.Term, output: *u8) {
+    var i: usize = 0;
+    for (i < term.len && i < observability.MAX_TERM_BYTES) {
+        output[i] = term.bytes[i];
+        i         = i + 1;
+    }
+    output[i] = 0;
+}
+
+# whether key `a` sorts before key `b`, byte by byte
+fun before(a: *u8, b: *u8) bool {
+    var i: usize = 0;
+    for (a[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    ret a[i] < b[i];
+}
+
+fun collect(signal: *observability.Signal, terms: *Terms) {
+    terminate(?signal.name, ?terms.name[0]);
+    terms.count = 0;
+    var i: usize = 0;
+    for (i < signal.label_len && i < observability.MAX_LABELS) {
+        if (signal.labels[i].populated) {
+            terminate(?signal.labels[i].name, ?terms.keys[terms.count][0]);
+            terminate(?signal.labels[i].value, ?terms.values[terms.count][0]);
+            terms.order[terms.count] = terms.count;
+            terms.count              = terms.count + 1;
+        }
+        i = i + 1;
+    }
+    i = 1;
+    for (i < terms.count) {
+        var at: usize = i;
+        for (at > 0 && before(?terms.keys[terms.order[at]][0],
+            ?terms.keys[terms.order[at - 1]][0])) {
+            val moved: usize = terms.order[at];
+            terms.order[at]     = terms.order[at - 1];
+            terms.order[at - 1] = moved;
+            at                  = at - 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun key_of(terms: *Terms, i: usize) str {
+    ret (?terms.keys[terms.order[i]][0])::str;
+}
+
+fun value_of(terms: *Terms, i: usize) str {
+    ret (?terms.values[terms.order[i]][0])::str;
+}
+
+fun metric(bridge: *Telemetry, kind: observe.Kind, terms: *Terms, output: *observe.Metric) bool {
+    if (terms.count > observe.MAX_LABELS) { ret false; }
+    var labels: [observe.MAX_LABELS]observe.Label;
+    var i:      usize = 0;
+    for (i < terms.count) {
+        labels[i] = observe.Label{key: key_of(terms, i), value: value_of(terms, i)};
+        i         = i + 1;
+    }
+    ret observe.metric(bridge.source, kind, (?terms.name[0])::str, ?labels[0], terms.count,
+        nil, 0, output) == observe.STATUS_OK;
+}
+
+fun event(bridge: *Telemetry, value: i64, terms: *Terms) {
+    if (terms.count + 1 > observe.MAX_LOG_FIELDS) { ret; }
+    var fields: [observe.MAX_LOG_FIELDS]record.Field;
+    var i:      usize = 0;
+    for (i < terms.count) {
+        fields[i] = record.field_string(key_of(terms, i), value_of(terms, i));
+        i         = i + 1;
+    }
+    fields[terms.count] = record.field_i64("value", value);
+    observe.log(bridge.source, record.INFO, (?terms.name[0])::str, ?fields[0],
+        terms.count + 1, nil);
+}
+
+fun emit(ctx: ptr, signal: *observability.Signal) {
+    val bridge: *Telemetry = ctx::*Telemetry;
+    if (bridge == nil || !bridge.valid || !bridge.bound || signal == nil || !signal.valid) {
+        ret;
+    }
+    var terms: Terms;
+    collect(signal, ?terms);
+    var series: observe.Metric;
+    if (signal.kind == observability.SIGNAL_COUNTER) {
+        if (signal.value >= 0 && metric(bridge, observe.COUNTER, ?terms, ?series)) {
+            observe.add(series, signal.value::u64);
+        }
+    }
+    or (signal.kind == observability.SIGNAL_GAUGE) {
+        if (metric(bridge, observe.GAUGE, ?terms, ?series)) { observe.set(series, signal.value); }
+    }
+    or (signal.kind == observability.SIGNAL_EVENT) { event(bridge, signal.value, ?terms); }
+}
+
+pub fun make(bridge: *Telemetry) bool {
+    if (bridge == nil) { ret false; }
+    bridge.telemetry = observability.Telemetry{ctx: bridge::ptr, emit: emit};
+    bridge.bound     = false;
+    bridge.valid     = true;
+    ret true;
+}
+
+# names the registered application `name` as the one the bridge's signals are
+# attributed to. a bridge serves one application, so a second bind is refused
+pub fun bind(bridge: *Telemetry, registry: *service.Applications, name: str) bool {
+    if (bridge == nil || !bridge.valid || bridge.bound)  { ret false; }
+    if (!observe.source(registry, name, ?bridge.source)) { ret false; }
+    bridge.bound = true;
+    ret true;
+}
+
+# laurel's telemetry sink, for an application's provider set under
+# `observability.telemetry_key()`, or nil when the bridge was never made
+pub fun telemetry(bridge: *Telemetry) *observability.Telemetry {
+    if (bridge == nil || !bridge.valid) { ret nil; }
+    ret ?bridge.telemetry;
+}
+
+fun hex_digit(value: u8) u8 {
+    if (value < 10) { ret '0' + value; }
+    ret 'a' + value - 10;
+}
+
+# one request laurel served, from the request bridge
+pub rec Span {
+    # the trace hedge started for the request, `active.telemetry`
+    trace:       *trace.Context;
+    route:       view.View;
+    outcome:     str;
+    status:      u16;
+    duration_ns: u64;
+    bytes_in:    u64;
+    bytes_out:   u64;
+}
+
+# writes the request's span as a record under hedge's trace for the request,
+# parented on hedge's span. a bridge not yet bound writes nothing
+pub fun span(bridge: *Telemetry, served: *Span) bool {
+    if (bridge == nil || !bridge.valid || !bridge.bound || served == nil
+        || served.trace == nil) { ret false; }
+    var parent: [16]u8;
+    var i:      usize = 0;
+    for (i < 8) {
+        val byte: u8 = served.trace.parent_id[i];
+        parent[i * 2]     = hex_digit(byte >> 4);
+        parent[i * 2 + 1] = hex_digit(byte & 0x0f);
+        i                 = i + 1;
+    }
+    var fields: [8]record.Field;
+    fields[0] = record.field_string("span", "laurel.request");
+    fields[1] = record.field_text("parent_id", ?parent[0], 16);
+    fields[2] = record.field_string("outcome", served.outcome);
+    fields[3] = record.field_u64("status", served.status::u64);
+    fields[4] = record.field_u64("duration_ns", served.duration_ns);
+    fields[5] = record.field_u64("bytes_in", served.bytes_in);
+    fields[6] = record.field_u64("bytes_out", served.bytes_out);
+    var count: usize = 7;
+    if (served.route.len != 0 && served.route.data != nil) {
+        fields[7] = record.field_text("route", served.route.data, served.route.len);
+        count     = 8;
+    }
+    ret observe.log(bridge.source, record.INFO, "request", ?fields[0], count, served.trace)
+        == observe.STATUS_OK;
+}

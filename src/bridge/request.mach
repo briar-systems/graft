@@ -5,8 +5,12 @@
 # and a request that suspends on its body parks the call and is resumed, never
 # restarted, on each later entry. its state lives in the request arena and is
 # found again through the call's finalizer slot, and the finalizer hands the
-# request back to laurel however the exchange settled.
+# request back to laurel however the exchange settled. when the application's
+# provider set resolves graft's providers, the finalizer then writes the
+# request's span under hedge's trace for it.
 
+use graft.bridge.providers;
+use graft.bridge.telemetry;
 use hedge.clock;
 use hedge.dispatch.call;
 use hedge.service;
@@ -27,6 +31,7 @@ use std.types.bool.true;
 use std.types.char.char;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
 use std.types.view;
 
 # the request identifier is the hedge trace id in hex, so laurel's request
@@ -43,6 +48,11 @@ rec RequestState {
     execution:   middleware.Execution;
     outcome:     middleware.Outcome;
     identifier:  [REQUEST_ID_BYTES]char;
+    # graft's providers the application resolves, or nil, and what its span
+    # reports: the route laurel's router chose and when laurel admitted it
+    providers: *providers.Providers;
+    route:     view.View;
+    started:   time.Instant;
     # the earlier of the exchange's deadline and the application's handler
     # deadline, absolute monotonic. laurel narrows it and the host enforces it
     deadline:     time.Instant;
@@ -72,12 +82,33 @@ fun finalize_request(owner: ptr, active: *call.Call) bool {
         state.outcome = app.abandon(state.application, ?state.execution,
             ?state.context);
     }
-    val released: bool = app.release_context(state.application, ?state.context,
-        app.Termination{outcome: state.outcome, reason: cancel.reason(active_scope),
+    val reason:   cancel.Reason = cancel.reason(active_scope);
+    val finished: time.Instant  = clock.instant();
+    val released: bool          = app.release_context(state.application, ?state.context,
+        app.Termination{outcome: state.outcome, reason: reason,
         status:   active.exchange.completion.status,
-        transfer: active.exchange.completion, finished: clock.instant()});
+        transfer: active.exchange.completion, finished: finished});
     state.bound = false;
+    if (state.providers != nil) {
+        var served: telemetry.Span = telemetry.Span{trace: active.telemetry,
+            route:       state.route, outcome: outcome_text(state.outcome, reason),
+            status:      active.exchange.completion.status::u16,
+            duration_ns: clock.between_ns(state.started, finished),
+            bytes_in:    active.exchange.completion.bytes_in,
+            bytes_out:   active.exchange.completion.bytes_out};
+        telemetry.span(?state.providers.telemetry, ?served);
+    }
     ret released;
+}
+
+# how laurel's execution of the request ended
+fun outcome_text(outcome: middleware.Outcome, reason: cancel.Reason) str {
+    if (outcome.status == middleware.EXECUTION_RESPOND
+        || outcome.status == middleware.EXECUTION_NEXT) { ret "completed"; }
+    if (outcome.status == middleware.EXECUTION_ERROR_RENDERED
+        || outcome.status == middleware.EXECUTION_ERROR_UNMAPPED) { ret "failed"; }
+    if (sel reason.timed_out) { ret "timed_out"; }
+    ret "cancelled";
 }
 
 fun hex_digit(value: u8) char {
@@ -160,6 +191,7 @@ fun start_request(application: *app.App, active: *call.Call,
     }
     val state: *RequestState = allocated.ok;
     state.application = application;
+    state.providers   = providers.resolve(application.providers);
     if (!render_request_id(active.telemetry, ?state.identifier[0])) {
         ret exchange.SERVICE_FAILED;
     }
@@ -180,11 +212,13 @@ fun start_request(application: *app.App, active: *call.Call,
         route_name = service.text_view(
             application.router.routes[state.terminal.matched.route].name);
     }
+    state.route   = route_name;
+    state.started = clock.instant();
     if (!app.bind_context(application, ?state.context, ?state.recorder,
         app.Admission{exchange: bound, params: params, allocator: arena,
         request_id: view.View{data: ?state.identifier[0],
         len:        REQUEST_ID_BYTES},
-        route_name: route_name, started: clock.instant()})) {
+        route_name: route_name, started: state.started})) {
         ret exchange.SERVICE_FAILED;
     }
     state.bound        = true;
