@@ -1,0 +1,127 @@
+# the providers graft supplies a hosted laurel application, over hedge's
+# facilities for hosted code, as one entry of the application's provider set
+#
+# the entry answers laurel's task, secret, configuration and telemetry keys
+# with graft's bridges, and graft's own key with the providers themselves, so
+# the lifecycle and request bridges find the ones the application resolves.
+# the secret, settings and telemetry bridges read hedge's facilities for one
+# registered application, which `bind` names once it is mounted.
+
+use graft.bridge.secret;
+use graft.bridge.settings;
+use graft.bridge.task;
+use graft.bridge.telemetry;
+use hedge.service;
+use hedge_task: hedge.task;
+use laurel.config;
+use laurel.observability;
+use laurel.provider;
+use laurel_secret: laurel.secret;
+use laurel_task:   laurel.task;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+# caller-owned. it stays where it is made from `make` until the process has
+# stopped and `close` answers true, and serves one application
+pub rec Providers {
+    tasks:     task.Tasks;
+    secrets:   secret.Secrets;
+    settings:  settings.Settings;
+    telemetry: telemetry.Telemetry;
+    valid:     bool;
+}
+
+# the provider.Set key under which graft's entry answers the `*Providers`
+pub fun key() view.View {
+    ret view.view("graft.providers", 15);
+}
+
+fun same_key(a: view.View, b: view.View) bool {
+    if (a.len != b.len || a.data == nil || b.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun found(value: ptr) res[ptr, view.View] {
+    ret res[ptr, view.View].ok{value};
+}
+
+# the facilities graft supplies under their keys. any other key is not graft's
+fun resolve_provider(context: ptr, wanted: view.View) res[ptr, view.View] {
+    val providers: *Providers = context::*Providers;
+    if (same_key(wanted, laurel_task.key())) { ret found(task.provider(?providers.tasks)::ptr); }
+    if (same_key(wanted, laurel_secret.key())) {
+        ret found(secret.source(?providers.secrets)::ptr);
+    }
+    if (same_key(wanted, config.key())) { ret found(settings.provider(?providers.settings)::ptr); }
+    if (same_key(wanted, observability.telemetry_key())) {
+        ret found(telemetry.telemetry(?providers.telemetry)::ptr);
+    }
+    if (same_key(wanted, key())) { ret found(providers::ptr); }
+    ret found(nil);
+}
+
+# makes every bridge, the task bridge over hedge's task facility
+# ---
+# providers: storage, which stays in place until `close`
+# facility:  the task facility the process hands hedge in
+#            `composition.Options.tasks`
+# ret:       whether every bridge was made
+pub fun make(providers: *Providers, facility: *hedge_task.Tasks) bool {
+    if (providers == nil) { ret false; }
+    providers.valid = false;
+    if (!task.make(?providers.tasks, facility) || !settings.make(?providers.settings)
+        || !telemetry.make(?providers.telemetry)) { ret false; }
+    if (!secret.make(?providers.secrets)) { ret false; }
+    providers.valid = true;
+    ret true;
+}
+
+# the entry for the application's provider set. an application that supplies
+# its own provider for one of these keys lists it before this entry
+pub fun entry(providers: *Providers) provider.Provider {
+    ret provider.Provider{ctx: providers::ptr, resolve: resolve_provider};
+}
+
+# graft's providers the set resolves, or nil when it lists no graft entry
+pub fun resolve(set: *provider.Set) *Providers {
+    if (set == nil) { ret nil; }
+    val resolved: res[ptr, view.View] = provider.resolve(set, key());
+    if (sel resolved.err) { ret nil; }
+    val providers: *Providers = resolved.ok::*Providers;
+    if (providers == nil || !providers.valid) { ret nil; }
+    ret providers;
+}
+
+# names the registered application `name` as the one whose secrets, settings
+# and telemetry the bridges reach
+pub fun bind(providers: *Providers, registry: *service.Applications, name: str) bool {
+    if (providers == nil || !providers.valid) { ret false; }
+    ret secret.bind(?providers.secrets, registry, name)
+        && settings.bind(?providers.settings, registry, name)
+        && telemetry.bind(?providers.telemetry, registry, name);
+}
+
+# moves the settings the application reads to the generation hedge published
+pub fun take_generation(providers: *Providers) {
+    if (providers == nil || !providers.valid) { ret; }
+    settings.take_generation(?providers.settings);
+}
+
+# gives up what laurel holds for the bridges. refused while a secret borrow is
+# in flight
+pub fun close(providers: *Providers) bool {
+    if (providers == nil || !providers.valid) { ret true; }
+    if (!secret.close(?providers.secrets))    { ret false; }
+    providers.valid = false;
+    ret true;
+}

@@ -5,12 +5,25 @@
 # drain deadline and stops it once the last worker has stopped. laurel's
 # transitions already answer pending rather than block, which is what a
 # supervisor step must do.
+#
+# the task provider the application's provider set resolves drains beside the
+# application toward the same deadline, and is stopped after it, so the
+# application's drain is not done while one of its task runs is in flight.
+#
+# when the application's provider set resolves graft's providers, the start
+# step hands their settings bridge the generation hedge published before the
+# application starts, and the reload step hands it each generation a reload
+# publishes. the application is never restarted.
 
+use graft.bridge.providers;
+use hedge.clock;
 use hedge.service;
 use laurel.app;
 use laurel.lifecycle;
+use laurel.task;
 use std.chrono.time;
 use std.types.option.opt;
+use std.types.view;
 
 fun step(result: lifecycle.Transition) service.Step {
     if (result.status == lifecycle.TRANSITION_OK) {
@@ -23,27 +36,91 @@ fun step(result: lifecycle.Transition) service.Step {
 }
 
 fun start(owner: ptr) service.Step {
-    ret step(app.start(owner::*app.App));
+    val application: *app.App = owner::*app.App;
+    providers.take_generation(providers.resolve(application.providers));
+    ret step(app.start(application));
 }
 
 fun ready(owner: ptr) service.Step {
     ret step(app.poll_ready(owner::*app.App));
 }
 
+# the application's task provider, or nil when its host supplies none
+fun tasks_of(application: *app.App) *task.Provider {
+    ret task.resolve(application.providers);
+}
+
+fun done() service.Step {
+    ret service.Step{status: service.STEP_DONE, detail: view.view(nil, 0)};
+}
+
+fun pending() service.Step {
+    ret service.Step{status: service.STEP_PENDING, detail: view.view(nil, 0)};
+}
+
+# one turn of the task provider's drain, toward the application's deadline
+fun drain_tasks(application: *app.App, deadline: opt[time.Instant]) service.Step {
+    val tasks: *task.Provider = tasks_of(application);
+    if (tasks == nil) { ret done(); }
+    val drained: task.Drain = task.drain(tasks, deadline);
+    if (drained.status == task.DRAIN_DONE)    { ret done(); }
+    if (drained.status == task.DRAIN_PENDING) { ret pending(); }
+    ret service.Step{status: service.STEP_FAILED,
+        detail: view.view("the task provider refused its drain", 35)};
+}
+
+# the application and its tasks drain side by side, and the drain is done once
+# both are. the supervisor passes the same deadline on every turn
 fun drain(owner: ptr, deadline: time.Instant) service.Step {
-    ret step(app.drain(owner::*app.App, opt[time.Instant].some{deadline}));
+    val application: *app.App          = owner::*app.App;
+    val until:       opt[time.Instant] = opt[time.Instant].some{deadline};
+    val tasks:       service.Step      = drain_tasks(application, until);
+    val drained:     service.Step      = step(app.drain(application, until));
+    if (drained.status != service.STEP_DONE) { ret drained; }
+    ret tasks;
+}
+
+# the task provider stops once the application has. a drain the supervisor
+# never asked for, as when the process stops without shutting down, begins
+# here with a deadline already passed, and a drain already under way keeps its
+# own deadline and refuses this one
+fun stop_tasks(application: *app.App) service.Step {
+    val tasks: *task.Provider = tasks_of(application);
+    if (tasks == nil) { ret done(); }
+    task.drain(tasks, opt[time.Instant].some{clock.instant()});
+    val stopped: task.Status = task.stop(tasks);
+    if (stopped == task.STATUS_BUSY)                                 { ret pending(); }
+    if (stopped == task.STATUS_OK || stopped == task.STATUS_INVALID) { ret done(); }
+    ret service.Step{status: service.STEP_FAILED,
+        detail: view.view("the task provider did not stop", 30)};
 }
 
 # a stop that ran every component's stop still answers the failure that came
-# before it, which the supervisor reported when it happened, so it is done
+# before it, which the supervisor reported when it happened, so it is done. the
+# supervisor keeps asking while this answers pending, so a stop that is waiting
+# on the tasks finds the application already terminal and asks only how its
+# cleanup ended
 fun stop(owner: ptr) service.Step {
-    val application: *app.App             = owner::*app.App;
-    val result:      lifecycle.Transition = app.stop(application);
-    if (result.status == lifecycle.TRANSITION_FAILED && lifecycle.terminal(application.lifecycle)
-        && app.cleanup_failure(application).status == lifecycle.TRANSITION_OK) {
-        ret service.Step{status: service.STEP_DONE, detail: result.error};
+    val application: *app.App = owner::*app.App;
+    if (!lifecycle.terminal(application.lifecycle)) {
+        val result: lifecycle.Transition = app.stop(application);
+        if (result.status == lifecycle.TRANSITION_PENDING) { ret step(result); }
+        if (result.status != lifecycle.TRANSITION_OK
+            && !lifecycle.terminal(application.lifecycle)) {
+            # a failed stop is not asked again, so the tasks have their one turn
+            stop_tasks(application);
+            ret step(result);
+        }
     }
-    ret step(result);
+    val tasks: service.Step = stop_tasks(application);
+    if (tasks.status != service.STEP_DONE) { ret tasks; }
+    ret step(app.cleanup_failure(application));
+}
+
+# a reload never touches the application itself, only what graft hands it
+fun reload(owner: ptr) service.Step {
+    providers.take_generation(providers.resolve((owner::*app.App).providers));
+    ret done();
 }
 
 # the application's lifecycle components, bounded by its
@@ -51,5 +128,5 @@ fun stop(owner: ptr) service.Step {
 pub fun hooks(application: *app.App) service.Lifecycle {
     if (application == nil || !application.valid) { ret service.no_lifecycle(); }
     ret service.Lifecycle{ctx: application::ptr, start: start, ready: ready,
-        drain: drain, stop: stop};
+        drain: drain, stop: stop, reload: reload};
 }

@@ -6,3 +6,8 @@ use std.runtime;
 fwd graft.host;
 fwd graft.bridge.request;
 fwd graft.bridge.lifecycle;
+fwd graft.bridge.task;
+fwd graft.bridge.secret;
+fwd graft.bridge.settings;
+fwd graft.bridge.telemetry;
+fwd graft.bridge.providers;

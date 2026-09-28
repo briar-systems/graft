@@ -1,0 +1,95 @@
+# the settings bridge: laurel's configuration provider over hedge's settings
+#
+# a laurel application reads its configuration by key through `laurel.config`,
+# and the bridge reads it from the `settings` table of the application's own
+# section of hedge's configuration. it reads one generation through a view it
+# holds, taken in the lifecycle's start step and again in its reload step, so
+# the application sees a reload once hedge has published it and reads nothing
+# before hedge starts it. hedge's read
+# statuses 1 to 4 are laurel's, and a secret reference or a kind mismatch, which
+# laurel has no status for, reads as invalid.
+
+use hedge.service;
+use hedge.settings;
+use laurel.config;
+use std.sync.mutex;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+# caller-owned bridge state. it stays where it is made from `make` until the
+# process has stopped
+pub rec Settings {
+    source: settings.Source;
+    # the generation reads go to, once `take_generation` has taken one
+    view:     settings.View;
+    viewed:   bool;
+    provider: config.Provider;
+    lock:     mutex.Mutex;
+    bound:    bool;
+    valid:    bool;
+}
+
+fun status(value: settings.Status) config.Status {
+    if (value == settings.READ_FOUND)     { ret config.READ_FOUND; }
+    if (value == settings.READ_MISSING)   { ret config.READ_MISSING; }
+    if (value == settings.READ_TOO_LARGE) { ret config.READ_TOO_LARGE; }
+    ret config.READ_INVALID;
+}
+
+fun read(ctx: ptr, key: view.View, output: *u8, capacity: usize) config.Read {
+    val bridge: *Settings = ctx::*Settings;
+    if (bridge == nil || !bridge.valid || !bridge.bound) {
+        ret config.Read{status: config.READ_INVALID, len: 0};
+    }
+    mutex.lock(?bridge.lock);
+    val viewed:  bool          = bridge.viewed;
+    val current: settings.View = bridge.view;
+    mutex.unlock(?bridge.lock);
+    if (!viewed) { ret config.Read{status: config.READ_INVALID, len: 0}; }
+    val found:       settings.Read = settings.read(current, key, output, capacity);
+    val read_status: config.Status = status(found.status);
+    if (read_status == config.READ_INVALID) { ret config.Read{status: read_status, len: 0}; }
+    ret config.Read{status: read_status, len: found.len};
+}
+
+pub fun make(bridge: *Settings) bool {
+    if (bridge == nil) { ret false; }
+    bridge.viewed   = false;
+    bridge.provider = config.Provider{ctx: bridge::ptr, read: read};
+    bridge.lock     = mutex.make();
+    bridge.bound    = false;
+    bridge.valid    = true;
+    ret true;
+}
+
+# names the registered application `name` as the one whose settings the bridge
+# reads. a bridge serves one application, so a second bind is refused
+pub fun bind(bridge: *Settings, registry: *service.Applications, name: str) bool {
+    if (bridge == nil || !bridge.valid || bridge.bound)   { ret false; }
+    if (!settings.source(registry, name, ?bridge.source)) { ret false; }
+    bridge.bound = true;
+    ret true;
+}
+
+# moves reads to the generation the process has published. the lifecycle's
+# start step calls it before the application starts, and its reload step once
+# a reload has published
+pub fun take_generation(bridge: *Settings) {
+    if (bridge == nil || !bridge.valid || !bridge.bound) { ret; }
+    val current: settings.View = settings.current(bridge.source);
+    mutex.lock(?bridge.lock);
+    bridge.view   = current;
+    bridge.viewed = true;
+    mutex.unlock(?bridge.lock);
+}
+
+# laurel's configuration provider, for an application's provider set under
+# `config.key()`, or nil when the bridge was never made
+pub fun provider(bridge: *Settings) *config.Provider {
+    if (bridge == nil || !bridge.valid) { ret nil; }
+    ret ?bridge.provider;
+}

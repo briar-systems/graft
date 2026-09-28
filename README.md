@@ -34,10 +34,37 @@ fun main(argc: i64, argv: **u8) i64 {
 - `host.mount(registry, name, application, memory_bytes)` registers an assembled
   application into a registry a program already composes with.
 - `graft.bridge.request` and `graft.bridge.lifecycle` are the request bridge and
-  the lifecycle bridge `mount` registers.
+  the lifecycle bridge `mount` registers. The lifecycle bridge drains the task
+  provider the application's provider set resolves beside the application,
+  toward the same deadline, and stops it after the application. Its `reload`
+  step, which hedge calls once a reload has published, moves the application's
+  settings to the new generation.
+- `Setup.providers` is the provider entry graft supplies, for the application
+  to list in its `provider.Set`. It answers laurel's provider keys with
+  graft's bridges over hedge's facilities for hosted code:
+  - `laurel.task` with `graft.bridge.task`, so the application's tasks run on
+    the task thread hedge's supervisor owns. graft makes that facility, or
+    adapts the one a program passes in `Options.process.tasks`.
+  - `laurel.secret` with `graft.bridge.secret`, which borrows the secrets the
+    configuration's `[application.<name>.secrets]` grants the application.
+    Each value stays secret-typed from hedge's store to the application's use.
+  - `laurel.config` with `graft.bridge.settings`, which reads the
+    application's `[application.<name>.settings]`. hedge's read statuses 1 to 4
+    are laurel's, and a secret reference or a kind mismatch reads as
+    `READ_INVALID`.
+  - `laurel.telemetry` with `graft.bridge.telemetry`. A counter or a gauge is
+    the series `app_<name>` labelled with the application, and an event is a
+    log record attributed to it. The request bridge also writes each request's
+    span as a record under hedge's trace for it, with hedge's span as its
+    `parent_id`.
+
+  `mount` binds these to the application it registers.
+  A program that calls `mount` itself makes a `graft.bridge.providers.Providers`
+  over the task facility it hands hedge and lists its `entry` in the
+  application's provider set.
 
 graft imports only the items hedge's `doc/HOSTING.md` names as the host
-contract (version 1.1). [`example/`](example) is a complete application served
+contract (version 1.7). [`example/`](example) is a complete application served
 this way.
 
 ## Build

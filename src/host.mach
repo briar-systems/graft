@@ -8,9 +8,10 @@
 # the supervisor itself.
 #
 # graft imports only the hedge items hedge's `doc/HOSTING.md` names as the host
-# contract, version 1.1.
+# contract, version 1.7.
 
 use graft.bridge.lifecycle;
+use graft.bridge.providers;
 use graft.bridge.request;
 use hedge.composition;
 use hedge.config.loader;
@@ -21,8 +22,10 @@ use hedge_lifecycle: hedge.lifecycle;
 use hedge.service;
 use hedge.spread;
 use hedge.supervisor;
+use hedge_task: hedge.task;
 use http.core.message;
 use laurel.app;
+use laurel.provider;
 use std.allocator;
 use std.allocator.fixed;
 use std.allocator.page;
@@ -37,6 +40,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.view;
 
 pub val EXIT_OK:      i64 = 0;
 pub val EXIT_RUNTIME: i64 = 70;
@@ -49,7 +53,9 @@ pub val CONFIG_ARENA_BYTES: usize = 1048576;
 
 # register an assembled laurel application under `name`, with the request
 # bridge as its handler and the lifecycle bridge as its lifecycle. hedge's
-# supervisor starts it, so it is registered assembled and not yet started
+# supervisor starts it, so it is registered assembled and not yet started.
+# graft's providers the application's provider set resolves are bound to it,
+# so its secrets, settings and telemetry are the ones hedge keeps under `name`
 # ---
 # registry:     the registry the program hands `composition.Options.applications`
 # name:         the name the configuration's `application` routes to
@@ -61,8 +67,10 @@ pub fun mount(registry: *service.Applications, name: str, application: *app.App,
     if (registry == nil || name == nil || application == nil || !application.valid) {
         ret false;
     }
-    ret service.register_hosted(registry, name, request.handler(application),
-        lifecycle.hooks(application), memory_bytes);
+    if (!service.register_hosted(registry, name, request.handler(application),
+        lifecycle.hooks(application), memory_bytes)) { ret false; }
+    val supplied: *providers.Providers = providers.resolve(application.providers);
+    ret supplied == nil || providers.bind(supplied, registry, name);
 }
 
 # what an application is assembled against once the configuration is sealed
@@ -72,6 +80,13 @@ pub rec Setup {
     # the limits hedge commits every response under, which laurel's error
     # rendering must not exceed
     limits: message.Limits;
+    # the facilities graft supplies the application, as one entry for its
+    # provider set: laurel's task provider, whose tasks run on hedge's task
+    # thread, its secret source over the secrets hedge grants the application,
+    # its configuration provider over the application's settings, and its
+    # telemetry sink over hedge's metrics and log. an application that
+    # supplies its own provider for one of these lists it before this entry
+    providers: provider.Provider;
 }
 
 # assemble the application against the setup and answer it, not started, or
@@ -100,7 +115,9 @@ pub rec Options {
     # answers the configuration's `${ENV:NAME}` references
     resolver:     loader.Resolver;
     capabilities: loader.Capabilities;
-    # hedge's own process options. `applications` is graft's
+    # hedge's own process options. `applications` is graft's. `tasks` is the
+    # program's own task facility when it has one, and graft makes one when it
+    # is nil
     process: composition.Options;
     # whether the supervisor takes SIGINT, SIGTERM and SIGHUP
     signals: bool;
@@ -146,8 +163,12 @@ pub rec Process {
     diagnostics: schema.Diagnostics;
     composed:    composition.Runtime;
     supervising: supervisor.Supervisor;
-    supervised:  bool;
-    serving:     bool;
+    # the task facility graft made when the program gave none, and graft's
+    # providers, the task bridge over whichever facility the process runs
+    facility:   hedge_task.Tasks;
+    providers:  providers.Providers;
+    supervised: bool;
+    serving:    bool;
     # the exit status a start that did not serve settled on
     refused: i64;
 }
@@ -253,9 +274,22 @@ pub fun start(process: *Process, heap: *allocator.Allocator, options: Options,
     val candidate: *generation.Generation = seal(process, 0, 1);
     if (candidate == nil) { ret refuse(process, EXIT_CONFIG, nil); }
 
+    var composing: composition.Options = options.process;
+    composing.applications = ?process.registry;
+    if (composing.tasks == nil) {
+        if (!hedge_task.make(?process.facility, hedge_task.default_options())) {
+            ret refuse(process, EXIT_RUNTIME, "the task facility could not be made");
+        }
+        composing.tasks = ?process.facility;
+    }
+    if (!providers.make(?process.providers, composing.tasks)) {
+        ret refuse(process, EXIT_RUNTIME, "the providers could not be made");
+    }
+
     var setup: Setup = Setup{name: options.name,
         limits: connection.message_limits(?candidate.graph,
-        connection.config_from(?candidate.graph))};
+        connection.config_from(?candidate.graph)),
+        providers: providers.entry(?process.providers)};
     process.assembled = application.assemble(application.ctx, ?setup);
     if (process.assembled == nil) {
         ret refuse(process, EXIT_RUNTIME, "the application could not be assembled");
@@ -266,8 +300,6 @@ pub fun start(process: *Process, heap: *allocator.Allocator, options: Options,
         ret refuse(process, EXIT_RUNTIME, "the application could not be registered");
     }
 
-    var composing: composition.Options = options.process;
-    composing.applications = ?process.registry;
     val workers: usize                   = spread.count(?candidate.graph);
     val started: composition.StartReport = composition.start_process(?process.composed,
         heap, ?candidate.graph, candidate.id, ?process.diagnostics, composing, workers);
@@ -348,6 +380,10 @@ pub fun finish(process: *Process) i64 {
             if (code == EXIT_OK) { code = EXIT_RUNTIME; }
         }
         process.assembled = nil;
+    }
+    if (!providers.close(?process.providers)) {
+        say(process, "the providers did not close cleanly");
+        if (code == EXIT_OK) { code = EXIT_RUNTIME; }
     }
     if (code == EXIT_OK) {
         print.print(process.options.label);
