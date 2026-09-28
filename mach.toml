@@ -1,7 +1,7 @@
 [project]
 id = "graft"
-version = "0.2.0"
-mach = "^6.3"
+version = "0.3.0"
+mach = "^6.5"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -65,15 +65,15 @@ float_reassoc = false
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^9.3"
+version = "^9.4"
 
 [dep.hedge]
 git = "https://github.com/briar-systems/hedge"
-version = "^0.16"
+version = "^0.17"
 
 [dep.laurel]
 git = "https://github.com/briar-systems/laurel"
-version = "^0.22"
+version = "^0.23"
 
 [dep.http]
 git = "https://github.com/briar-systems/mach-http"

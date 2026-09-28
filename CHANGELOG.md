@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0] - 2026-09-28
+
+### Dependencies
+
+- **Breaking.** hedge `^0.17` (v0.17.0), laurel `^0.23` (v0.23.0), mach-http `^0.25` (v0.25.1) and mach-std `^9.4` (v9.4.1), committed as gitlinks with crypto v0.26.0, tls v0.16.0, quic v0.25.1 and acme v0.14.0. The example follows. Resolution is flat, so an application on graft moves to these with it. hedge 0.17 declares ACME certificates only as `[acme.certificate.<id>]` tables and refuses a route path without its leading `/`. laurel 0.23's decoders answer `invalid parameter`. std 9.4.1 maps a guard page below every linux thread stack.
+- **Breaking.** Requires mach 6.5 (`mach = "^6.5"`), since mach-http 0.25.1 does, and CI seeds mach v6.5.0.
+
 ## [0.2.0] - 2026-09-28
 
 graft bridges every laurel provider over hedge's host contract 1.7: tasks, secrets, configuration and telemetry (#4).

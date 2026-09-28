@@ -24,7 +24,8 @@ jobs:
     uses: briar-systems/.github/.github/workflows/mach-lib.yml@main
     with:
       heavy: ${{ inputs.heavy }}
-      mach-version: v6.3.0
+      # http 0.25.1 requires mach 6.5
+      mach-version: v6.5.0
       # crypto links std's start code that requires PSTATE.DIT on aarch64
       dit: required
       # the library reaches none of src/test/, so its tests run under the tests artifact
