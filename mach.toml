@@ -1,6 +1,6 @@
 [project]
 id = "graft"
-version = "0.4.0"
+version = "0.5.0"
 mach = "^7"
 src  = "src"
 work = "out/{target.name}/{profile.name}"
