@@ -1,45 +1,40 @@
 [project]
 id = "example"
-mach = "^6.5"
+mach = "^7"
 version = "0.1.0"
-src = "src"
-out = "out/{target.name}/{profile.name}"
+src  = "src"
+work = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
-default = true
-isa = "x86_64"
-os = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
 [target.linux-aarch64]
-isa = "aarch64"
-os = "linux"
+arch = "aarch64"
+sys = "linux"
 abi = "aapcs64"
 
 [target.darwin-aarch64]
-isa = "aarch64"
-os = "darwin"
-abi = "aapcs64"
+arch = "aarch64"
+sys = "darwin"
+abi = "darwinpcs"
 
 [profile.debug]
 default = true
-opt = 0
+optimize = false
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [profile.release]
-opt = 2
+optimize = true
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [artifact.graft-example]
 kind = "bin"
 entry = "bin/main.mach"
-out = "bin/graft-example"
+out = "{project.work}/bin/graft-example"
 targets = ["*"]
 link = []
 need = []
@@ -49,12 +44,12 @@ path = "../"
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^9.4"
+version = "^10.0.0"
 
 [dep.laurel]
 git = "https://github.com/briar-systems/laurel"
-version = "^0.23"
+version = "^0.24.0"
 
 [dep.http]
 git = "https://github.com/briar-systems/mach-http"
-version = "^0.25"
+version = "^0.26.0"

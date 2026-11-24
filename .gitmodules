@@ -46,3 +46,27 @@
 [submodule "example/dep/laurel"]
 	path = example/dep/laurel
 	url = https://github.com/briar-systems/laurel
+[submodule "dep/pki"]
+	path = dep/pki
+	url = https://github.com/briar-systems/mach-pki
+[submodule "example/dep/pki"]
+	path = example/dep/pki
+	url = https://github.com/briar-systems/mach-pki
+[submodule "dep/encoding"]
+	path = dep/encoding
+	url = https://github.com/briar-systems/mach-encoding
+[submodule "example/dep/encoding"]
+	path = example/dep/encoding
+	url = https://github.com/briar-systems/mach-encoding
+[submodule "dep/json"]
+	path = dep/json
+	url = https://github.com/briar-systems/mach-json
+[submodule "example/dep/json"]
+	path = example/dep/json
+	url = https://github.com/briar-systems/mach-json
+[submodule "dep/toml"]
+	path = dep/toml
+	url = https://github.com/briar-systems/mach-toml
+[submodule "example/dep/toml"]
+	path = example/dep/toml
+	url = https://github.com/briar-systems/mach-toml
