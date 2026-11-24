@@ -1,40 +1,41 @@
 [project]
 id = "graft"
-version = "0.3.0"
-mach = "^6.5"
-src = "src"
-out = "out/{target.name}/{profile.name}"
+version = "0.4.0"
+mach = "^7"
+src  = "src"
+work = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
-isa = "x86_64"
-os  = "linux"
-abi = "sysv64"
+arch = "x86_64"
+sys  = "linux"
+abi  = "sysv64"
 
 [target.linux-aarch64]
-isa = "aarch64"
-os  = "linux"
-abi = "aapcs64"
+arch = "aarch64"
+sys  = "linux"
+abi  = "aapcs64"
 
 [target.windows-x86_64]
-isa = "x86_64"
-os  = "windows"
-abi = "win64"
+arch = "x86_64"
+sys  = "windows"
+abi  = "win64"
 
 [target.darwin-x86_64]
-isa = "x86_64"
-os  = "darwin"
-abi = "sysv64"
+arch = "x86_64"
+sys  = "darwin"
+abi  = "sysv64"
 
 [target.darwin-aarch64]
-isa = "aarch64"
-os  = "darwin"
-abi = "aapcs64"
+arch = "aarch64"
+sys  = "darwin"
+abi  = "darwinpcs"
 
 [artifact.graft]
 kind = "static"
 default = true
+export = true
 entry = "lib/graft.mach"
-out = "lib/graft"
+out = "{project.work}/lib/graft"
 targets = ["*"]
 link = []
 need = []
@@ -43,38 +44,34 @@ need = []
 [artifact.tests]
 kind = "static"
 entry = "test/all.mach"
-out = "lib/tests"
+out = "{project.work}/lib/tests"
 targets = ["*"]
 link = []
 need = []
 
 [profile.debug]
 default = true
-opt = 0
+optimize = false
 debug = true
 simd = "scalarize"
-vectorize = false
-float_reassoc = false
 
 [profile.release]
-opt = 2
+optimize = true
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^9.4"
+version = "^10.0.0"
 
 [dep.hedge]
 git = "https://github.com/briar-systems/hedge"
-version = "^0.17"
+version = "^0.18.0"
 
 [dep.laurel]
 git = "https://github.com/briar-systems/laurel"
-version = "^0.23"
+version = "^0.24.0"
 
 [dep.http]
 git = "https://github.com/briar-systems/mach-http"
-version = "^0.25"
+version = "^0.26.0"

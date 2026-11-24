@@ -27,7 +27,6 @@ use std.chrono.time;
 use crypto_rand: std.crypto.rand;
 use io_error:    std.io.error;
 use std.memory;
-use std.memory.secret;
 use std.print;
 use std.sync.atomic;
 use std.sync.thread;
@@ -235,8 +234,8 @@ pub fun init_csrf(demo: *Application, ring: *csrf.KeyRing,
     keys[0].activated_at = 0;
     keys[0].issue_until  = 4102444800;
     keys[0].verify_until = 4102444800;
-    if (!rand_ok(secret.random_fill(?keys[0].key[0], 32))) { ret false; }
-    if (!csrf.init_ring(ring, keys, 1, 1, 0))              { ret false; }
+    if (!rand_ok(crypto_rand.fill_secret(?keys[0].key[0], 32))) { ret false; }
+    if (!csrf.init_ring(ring, keys, 1, 1, 0))                   { ret false; }
     ret csrf.init(?demo.protector, ring,
         csrf.Entropy{ctx: (?demo.entropy)::ptr,
         context_size:  $size_of(EntropyState),

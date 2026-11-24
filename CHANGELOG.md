@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0] - 2026-11-23
+
+### Dependencies
+
+- **Breaking.** Migrated to Mach 7 (`mach = "^7"`).
+- **Breaking.** Updated dependencies to `hedge` `^0.18.0` (v0.18.1), `laurel` `^0.24.0` (v0.24.0), `mach-http` `^0.26.0` (v0.26.0), and `mach-std` `^10.0.0` (v10.0.1), with `mach-crypto` v0.30.0, `mach-tls` v0.18.0, `mach-quic` v0.27.0, `mach-acme` v0.15.0, `mach-pki` v0.5.0, `mach-encoding` v0.1.0, `mach-json` v0.1.0, and `mach-toml` v0.1.0.
+
 ## [0.3.0] - 2026-09-28
 
 ### Dependencies

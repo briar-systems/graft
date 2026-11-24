@@ -1,4 +1,4 @@
-# the test-only modules the library never reaches: `mach test . --lib tests`
+# the test-only modules the library never reaches: `mach test . -a tests`
 # runs their tests
 
 use std.runtime;

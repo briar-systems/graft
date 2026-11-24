@@ -72,7 +72,7 @@ this way.
 ```sh
 mach dep pull .
 mach build .
-mach test . --lib tests --timeout 5m
+mach test . -a tests --timeout 5m
 ```
 
 The tests run a real process over a local socket, on Linux.
