@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.0] - 2026-11-24
+
+### Dependencies
+
+- **Breaking.** Updated dependencies to `hedge` `^0.19.0` (v0.19.1), `mach-std` `^10.1.0` (v10.1.1), and `laurel` v0.24.1, with `mach-tls` v0.18.1 and `mach-quic` v0.28.0. The example follows. Resolution is flat, so applications on graft move to these with it.
+
 ## [0.4.0] - 2026-11-23
 
 ### Dependencies
